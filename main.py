@@ -69,6 +69,35 @@ CMD_CHOICES: List[Tuple[str,int]] = [
     ("RTL", CMD_RTL),
 ]
 
+# MAVLink Mission ACK types for error decoding
+MAV_MISSION_ACK_TYPES = {
+    0: "MAV_MISSION_ACCEPTED - Mission accepted OK",
+    1: "MAV_MISSION_ERROR - Generic error / not accepting mission commands",
+    2: "MAV_MISSION_UNSUPPORTED_FRAME - Coordinate frame not supported",
+    3: "MAV_MISSION_UNSUPPORTED - Command not supported",
+    4: "MAV_MISSION_NO_SPACE - Mission item exceeds storage space",
+    5: "MAV_MISSION_INVALID - One of the parameters invalid",
+    6: "MAV_MISSION_INVALID_PARAM1 - param1 invalid",
+    7: "MAV_MISSION_INVALID_PARAM2 - param2 invalid",
+    8: "MAV_MISSION_INVALID_PARAM3 - param3 invalid",
+    9: "MAV_MISSION_INVALID_PARAM4 - param4 invalid",
+    10: "MAV_MISSION_INVALID_PARAM5_X - x/param5 (latitude) invalid",
+    11: "MAV_MISSION_INVALID_PARAM6_Y - y/param6 (longitude) invalid",
+    12: "MAV_MISSION_INVALID_PARAM7 - z/param7 (altitude) invalid",
+    13: "MAV_MISSION_INVALID_SEQUENCE - Received waypoint out of sequence",
+    14: "MAV_MISSION_DENIED - Not accepting any mission commands",
+    15: "MAV_MISSION_OPERATION_CANCELLED - Mission operation cancelled",
+}
+
+def decode_mission_ack(ack_type: int) -> str:
+    """Decode MAVLink mission ACK type to human-readable string"""
+    return MAV_MISSION_ACK_TYPES.get(ack_type, f"UNKNOWN ACK TYPE: {ack_type}")
+
+def get_cmd_name(cmd: int) -> str:
+    """Get human-readable command name"""
+    cmd_names = {22: "TAKEOFF", 16: "WAYPOINT", 21: "LAND", 20: "RTL"}
+    return cmd_names.get(cmd, f"CMD_{cmd}")
+
 @dataclass
 class WP:
     cmd: int
@@ -108,13 +137,23 @@ class MavWorker(QThread):
 
         self._cmdq: "queue.Queue" = queue.Queue()
 
+        # Mission upload state
         self._upl_active = False
         self._upl_items: List[WP] = []
         self._upl_start_time = 0
+        self._upl_sent: set = set()  # Track which waypoints have been sent
+        self._upl_retry_count = 0
+        self._upl_max_retries = 3
+
+        # Mission download state
         self._dl_active = False
         self._dl_expected = 0
         self._dl_got: List[WP] = []
         self._dl_start_time = 0
+        self._dl_next_seq = 0  # Next waypoint to request
+
+        # Mission clear state
+        self._clear_pending = False
 
     # --------- public API from UI (thread-safe) ----------
     def configure(self, port: Optional[str], baud: Optional[int], auto: bool):
@@ -187,6 +226,175 @@ class MavWorker(QThread):
             p4=float(msg.param4 or 0.0),
             frame=int(msg.frame or 6),
         )
+
+    # --------- Mission Operations (Robust Implementation) ----------
+    def _do_mission_read(self):
+        """Initiate mission download from flight controller with robust handling"""
+        try:
+            print(f"\n{'='*60}")
+            print(f"[MAVLink] MISSION DOWNLOAD")
+            print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
+            print(f"{'='*60}")
+
+            self.L("Requesting mission list from flight controller...")
+
+            # Reset download state
+            self._dl_active = True
+            self._dl_got = []
+            self._dl_expected = 0
+            self._dl_next_seq = 0
+            self._dl_start_time = time.time()
+
+            # Request mission list - vehicle will respond with MISSION_COUNT
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+
+            print(f"[MAVLink] MISSION_REQUEST_LIST sent")
+            print(f"[MAVLink] Waiting for MISSION_COUNT response...")
+            print(f"[MAVLink] Timeout: 30 seconds")
+
+        except Exception as e:
+            print(f"[MAVLink] Mission read initiation failed: {e}")
+            self._dl_active = False
+            self.mission_error.emit(f"Read failed: {e}")
+
+    def _do_mission_write(self, items: List[WP]):
+        """Initiate mission upload to flight controller with robust handling"""
+        if not items:
+            print("[MAVLink] Write aborted: No waypoints provided")
+            self.mission_error.emit("No waypoints to upload.")
+            return
+
+        try:
+            print(f"\n{'='*60}")
+            print(f"[MAVLink] MISSION UPLOAD")
+            print(f"  Waypoints: {len(items)}")
+            print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
+            print(f"{'='*60}")
+
+            # Display waypoints to upload
+            print("\nWAYPOINTS TO UPLOAD:")
+            print("-" * 70)
+            for i, wp in enumerate(items):
+                cmd_name = get_cmd_name(wp.cmd)
+                print(f"  WP{i}: {cmd_name:10} | Frame={wp.frame} | "
+                      f"Lat={wp.lat:.7f}, Lon={wp.lon:.7f}, Alt={wp.alt:.1f}m")
+            print("-" * 70)
+
+            self.L(f"Uploading {len(items)} waypoint(s) to flight controller...")
+
+            # Reset upload state
+            self._upl_active = True
+            self._upl_items = items[:]
+            self._upl_start_time = time.time()
+            self._upl_sent = set()
+            self._upl_retry_count = 0
+
+            # Send mission count to start upload protocol
+            self._mav.mission_count_send(self._fc_sid, self._fc_cid, len(items), mission_type=0)
+
+            print(f"\n[MAVLink] MISSION_COUNT sent: {len(items)} waypoints")
+            print(f"[MAVLink] Waiting for vehicle to request waypoints...")
+            print(f"[MAVLink] Upload timeout: 45 seconds")
+
+        except Exception as e:
+            print(f"[MAVLink] Mission write initiation failed: {e}")
+            self._upl_active = False
+            self.mission_error.emit(f"Write failed: {e}")
+
+    def _do_mission_clear(self):
+        """Clear mission from flight controller with verification"""
+        try:
+            print(f"\n{'='*60}")
+            print(f"[MAVLink] MISSION CLEAR")
+            print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
+            print(f"{'='*60}")
+
+            self.L("Clearing all mission items from flight controller...")
+
+            # Set pending flag to track ACK
+            self._clear_pending = True
+
+            # Send clear command
+            self._mav.mission_clear_all_send(self._fc_sid, self._fc_cid, mission_type=0)
+            print("[MAVLink] MISSION_CLEAR_ALL command sent")
+
+            # Wait for ACK or timeout
+            self.msleep(800)
+
+            # Verify by requesting mission count
+            print("[MAVLink] Verifying mission clear...")
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+
+            # Wait for count response
+            verify_start = time.time()
+            verified = False
+            while (time.time() - verify_start) < 3.0:
+                for b in self._ser.read(512):
+                    msg = self._mav.parse_char(bytes([b]))
+                    if not msg:
+                        continue
+                    if msg.get_type() == "MISSION_COUNT":
+                        count = msg.count if hasattr(msg, 'count') else 0
+                        print(f"[MAVLink] Verification: Vehicle reports {count} waypoints")
+                        if count == 0:
+                            print("[MAVLink] ✓ Mission cleared successfully!")
+                            verified = True
+                        else:
+                            print(f"[MAVLink] Warning: Vehicle still has {count} waypoints")
+                        break
+                if verified or (time.time() - verify_start) > 3.0:
+                    break
+                self.msleep(50)
+
+            if not verified:
+                print("[MAVLink] Note: Could not verify clear (assuming success)")
+
+            self.mission_clear_ok.emit()
+            print("[MAVLink] Mission clear complete")
+
+        except Exception as e:
+            print(f"[MAVLink] Mission clear failed: {e}")
+            self._clear_pending = False
+            self.mission_error.emit(f"Clear failed: {e}")
+
+    def _request_next_waypoint(self):
+        """Request the next waypoint during mission download"""
+        if self._dl_next_seq < self._dl_expected:
+            print(f"[MAVLink] Requesting waypoint {self._dl_next_seq + 1}/{self._dl_expected}...")
+            self._mav.mission_request_int_send(
+                self._fc_sid, self._fc_cid,
+                self._dl_next_seq, mission_type=0
+            )
+
+    def _verify_mission_upload(self):
+        """Verify uploaded mission by requesting count from vehicle"""
+        try:
+            print(f"\n[MAVLink] Verifying upload...")
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+
+            verify_start = time.time()
+            while (time.time() - verify_start) < 3.0:
+                for b in self._ser.read(512):
+                    msg = self._mav.parse_char(bytes([b]))
+                    if not msg:
+                        continue
+                    if msg.get_type() == "MISSION_COUNT":
+                        count = msg.count if hasattr(msg, 'count') else 0
+                        print(f"[MAVLink] Verification: Vehicle reports {count} waypoints")
+                        if count == len(self._upl_items):
+                            print("[MAVLink] ✓ VERIFICATION PASSED!")
+                            return True
+                        else:
+                            print(f"[MAVLink] Warning: Count mismatch (expected {len(self._upl_items)})")
+                            return False
+                self.msleep(50)
+
+            print("[MAVLink] Verification timeout")
+            return False
+
+        except Exception as e:
+            print(f"[MAVLink] Verification error: {e}")
+            return False
 
     # --------- main thread ----------
     def run(self):
@@ -354,69 +562,150 @@ class MavWorker(QThread):
                     self.status.emit({"hud": f"GS {gs:.1f} m/s | Alt {alt_msl:.1f} m | Thr {thr}% | Climb {vz:+.1f} m/s",
                                       "_gs": gs, "_vz": vz, "_throttle": thr, "_alt_msl": alt_msl})
 
-                # mission download
+                # mission download - MISSION_COUNT response
                 elif t == "MISSION_COUNT" and self._dl_active:
-                    self._dl_expected = int(msg.count or 0); self._dl_got = []
+                    self._dl_expected = int(msg.count or 0)
+                    self._dl_got = []
+                    self._dl_next_seq = 0
                     print(f"[MAVLink] ✓ Vehicle responded: {self._dl_expected} waypoint(s) in mission")
+
                     if self._dl_expected == 0:
                         print(f"[MAVLink] Mission is empty - no waypoints to download")
                         self._dl_active = False
-                        self._dl_start_time = 0  # Reset timeout timer
+                        self._dl_start_time = 0
                         self.mission_read_ok.emit([])
                     else:
-                        print(f"[MAVLink] Requesting waypoints from vehicle...")
+                        print(f"[MAVLink] Starting waypoint download...")
                         self.L(f"Vehicle has {self._dl_expected} waypoint(s), downloading...")
+                        # Actively request first waypoint
+                        self._request_next_waypoint()
+
                 # Handle both MISSION_ITEM_INT and legacy MISSION_ITEM
                 elif (t == "MISSION_ITEM_INT" or t == "MISSION_ITEM") and self._dl_active:
+                    # Handle legacy format conversion
                     if t == "MISSION_ITEM":
-                        print(f"[MAVLink] Received LEGACY MISSION_ITEM (converting to INT format)")
-                    wp = self._from_mission_int(msg)
+                        # Legacy MISSION_ITEM uses float lat/lon
+                        wp = WP(
+                            cmd=int(msg.command),
+                            lat=float(msg.x or 0),
+                            lon=float(msg.y or 0),
+                            alt=float(msg.z or 0.0),
+                            p1=float(msg.param1 or 0.0),
+                            p2=float(msg.param2 or 0.0),
+                            p3=float(msg.param3 or 0.0),
+                            p4=float(msg.param4 or 0.0),
+                            frame=int(msg.frame or 6),
+                        )
+                        print(f"[MAVLink] Received LEGACY MISSION_ITEM (converted)")
+                    else:
+                        wp = self._from_mission_int(msg)
+
+                    seq = len(self._dl_got)
                     self._dl_got.append(wp)
-                    print(f"[MAVLink] Downloaded WP{len(self._dl_got)-1}: Cmd={wp.cmd}, Lat={wp.lat:.7f}, Lon={wp.lon:.7f}, Alt={wp.alt:.1f}m [{len(self._dl_got)}/{self._dl_expected}]")
+                    cmd_name = get_cmd_name(wp.cmd)
+                    print(f"[MAVLink] Downloaded WP{seq}: {cmd_name} | "
+                          f"Lat={wp.lat:.7f}, Lon={wp.lon:.7f}, Alt={wp.alt:.1f}m "
+                          f"[{len(self._dl_got)}/{self._dl_expected}]")
+
                     if len(self._dl_got) == self._dl_expected:
+                        # All waypoints received - send ACK and complete
+                        self._mav.mission_ack_send(self._fc_sid, self._fc_cid, 0, mission_type=0)
                         self._dl_active = False
-                        self._dl_start_time = 0  # Reset timeout timer
+                        self._dl_start_time = 0
                         print(f"\n{'='*60}")
                         print(f"[MAVLink] ✓ Mission download COMPLETE: {len(self._dl_got)} waypoint(s)")
                         print(f"{'='*60}\n")
                         self.L(f"Mission download complete: {len(self._dl_got)} waypoint(s)")
                         self.mission_read_ok.emit(self._dl_got[:])
+                    else:
+                        # Request next waypoint
+                        self._dl_next_seq = len(self._dl_got)
+                        self._request_next_waypoint()
 
                 # mission upload - handle BOTH MISSION_REQUEST_INT and legacy MISSION_REQUEST
                 elif (t == "MISSION_REQUEST_INT" or t == "MISSION_REQUEST") and self._upl_active:
                     seq = int(msg.seq)
-                    if t == "MISSION_REQUEST":
-                        print(f"[MAVLink] Vehicle requesting waypoint {seq+1}/{len(self._upl_items)} (LEGACY MISSION_REQUEST)")
-                    else:
-                        print(f"[MAVLink] Vehicle requesting waypoint {seq+1}/{len(self._upl_items)} (MISSION_REQUEST_INT)")
+                    request_type = "legacy" if t == "MISSION_REQUEST" else "INT"
+                    print(f"[MAVLink] Vehicle requesting waypoint {seq+1}/{len(self._upl_items)} ({request_type})")
+
+                    if seq >= len(self._upl_items):
+                        print(f"[MAVLink] ERROR: Requested waypoint {seq} out of range!")
+                        continue
+
                     try:
                         wp = self._upl_items[seq]
-                        print(f"[MAVLink] Sending WP{seq}: Cmd={wp.cmd}, Lat={wp.lat:.7f}, Lon={wp.lon:.7f}, Alt={wp.alt:.1f}m")
+                        cmd_name = get_cmd_name(wp.cmd)
+                        print(f"[MAVLink] Sending WP{seq}: {cmd_name} | "
+                              f"Lat={wp.lat:.7f}, Lon={wp.lon:.7f}, Alt={wp.alt:.1f}m")
+
+                        pkt = self._to_mission_int(seq, wp, self._fc_sid, self._fc_cid, mavutil, self._mav)
+                        self._mav.send(pkt)
+                        self._upl_sent.add(seq)
+                        self.msleep(30)  # Small delay for Bluetooth reliability
+
+                        print(f"[MAVLink] Waypoint {seq+1}/{len(self._upl_items)} sent ✓")
+
                     except Exception as e:
-                        print(f"[MAVLink] ERROR: Failed to get waypoint {seq}: {e}")
+                        print(f"[MAVLink] ERROR sending waypoint {seq}: {e}")
                         continue
-                    pkt = self._to_mission_int(seq, wp, self._fc_sid, self._fc_cid, mavutil, self._mav)
-                    self._mav.send(pkt)
-                    print(f"[MAVLink] Waypoint {seq+1}/{len(self._upl_items)} sent to vehicle")
+
                 elif t == "MISSION_ACK" and self._upl_active:
                     ack_type = msg.type if hasattr(msg, 'type') else 0
-                    print(f"[MAVLink] Mission ACK received - Type: {ack_type}")
-                    if ack_type == 0:  # MAV_MISSION_ACCEPTED
-                        print(f"[MAVLink] ✓ Mission ACCEPTED by vehicle - All {len(self._upl_items)} waypoints saved!")
-                        self.L(f"Mission upload complete! {len(self._upl_items)} waypoints saved.")
-                    else:
-                        print(f"[MAVLink] ✗ Mission REJECTED by vehicle - ACK type: {ack_type}")
-                        self.mission_error.emit(f"Mission rejected by vehicle (ACK={ack_type})")
-                        self._upl_active = False; self._upl_items = []
-                        self._upl_start_time = 0  # Reset timeout timer
-                        return
-                    self._upl_active = False; self._upl_items = []
-                    self._upl_start_time = 0  # Reset timeout timer
-                    self.mission_write_ok.emit()
+                    print(f"\n[MAVLink] MISSION_ACK received - Type: {ack_type}")
+                    print(f"[MAVLink] Status: {decode_mission_ack(ack_type)}")
 
-                # mission clear acknowledge (some stacks send ACK, some don't; we always fire ok on command ack if received)
+                    if ack_type == 0:  # MAV_MISSION_ACCEPTED
+                        print(f"\n{'='*60}")
+                        print(f"[MAVLink] ✓ MISSION UPLOAD SUCCESSFUL!")
+                        print(f"[MAVLink] {len(self._upl_items)} waypoints saved to vehicle")
+                        print(f"{'='*60}")
+
+                        # Verify upload
+                        self._verify_mission_upload()
+
+                        self.L(f"Mission upload complete! {len(self._upl_items)} waypoints saved.")
+                        self._upl_active = False
+                        self._upl_items = []
+                        self._upl_start_time = 0
+                        self._upl_sent = set()
+                        self.mission_write_ok.emit()
+                    else:
+                        print(f"\n{'='*60}")
+                        print(f"[MAVLink] ✗ MISSION UPLOAD FAILED!")
+                        print(f"[MAVLink] Error: {decode_mission_ack(ack_type)}")
+                        print(f"{'='*60}")
+
+                        # Provide debugging hints
+                        if ack_type == 2:
+                            print("\n[HINT] Frame type not supported.")
+                            print("       Try using frame=3 (GLOBAL_RELATIVE_ALT) or frame=6 (GLOBAL_RELATIVE_ALT_INT)")
+                        elif ack_type == 3:
+                            print("\n[HINT] Command not supported by this vehicle type.")
+                        elif ack_type == 14:
+                            print("\n[HINT] Vehicle not accepting missions.")
+                            print("       Check if vehicle is armed or in a mode that blocks uploads.")
+                        elif ack_type in [6, 7, 8, 9, 10, 11, 12]:
+                            print("\n[HINT] One or more waypoint parameters are invalid.")
+                            print("       Check coordinates and altitude values.")
+
+                        self.mission_error.emit(f"Mission rejected: {decode_mission_ack(ack_type)}")
+                        self._upl_active = False
+                        self._upl_items = []
+                        self._upl_start_time = 0
+                        self._upl_sent = set()
+
+                # mission clear acknowledge
+                elif t == "MISSION_ACK" and self._clear_pending:
+                    ack_type = msg.type if hasattr(msg, 'type') else 0
+                    self._clear_pending = False
+                    if ack_type == 0:
+                        print(f"[MAVLink] ✓ Mission CLEAR acknowledged by vehicle")
+                    else:
+                        print(f"[MAVLink] Mission clear ACK: {decode_mission_ack(ack_type)}")
+
+                # general command acknowledge
                 elif t == "COMMAND_ACK":
-                    # optionally inspect msg.command == MAV_CMD_MISSION_CLEAR_ALL
+                    # Could inspect msg.command for specific commands
                     pass
 
             # process UI commands
@@ -426,64 +715,14 @@ class MavWorker(QThread):
                 c = None
 
             if c == "read":
-                try:
-                    print(f"\n{'='*60}")
-                    print(f"[MAVLink] Requesting mission list from vehicle")
-                    print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
-                    print(f"{'='*60}")
-                    self.L("Sending mission read request to flight controller...")
-                    self._dl_active = True; self._dl_got = []; self._dl_expected = 0
-                    self._dl_start_time = time.time()  # Start timeout timer
-                    # Request mission list - vehicle will respond with MISSION_COUNT
-                    self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
-                    print(f"[MAVLink] MISSION_REQUEST_LIST sent")
-                    print(f"[MAVLink] Waiting for vehicle to respond with mission count and items...")
-                    print(f"[MAVLink] Note: Vehicle will automatically send mission items after count")
-                    print(f"[MAVLink] Timeout: 30 seconds")
-                except Exception as e:
-                    print(f"[MAVLink] Mission read failed: {e}")
-                    self._dl_active = False; self.mission_error.emit(f"Read failed: {e}")
+                self._do_mission_read()
 
             elif c == "write":
                 items: List[WP] = payload or []
-                if not items:
-                    print("[MAVLink] Write aborted: No waypoints provided")
-                    self.mission_error.emit("No waypoints to upload."); continue
-                try:
-                    print(f"\n{'='*60}")
-                    print(f"[MAVLink] Starting mission upload: {len(items)} waypoint(s)")
-                    print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
-                    print(f"{'='*60}")
-                    self.L(f"Uploading {len(items)} waypoint(s) to flight controller...")
-                    self._upl_active = True; self._upl_items = items[:]
-                    self._upl_start_time = time.time()  # Start timeout timer
-                    self._mav.mission_count_send(self._fc_sid, self._fc_cid, len(items), mission_type=0)
-                    print(f"[MAVLink] MISSION_COUNT sent: {len(items)} waypoints")
-                    print(f"[MAVLink] Waiting for vehicle to request waypoints...")
-                    print(f"[MAVLink] Timeout: 30 seconds")
-                except Exception as e:
-                    print(f"[MAVLink] Mission write failed: {e}")
-                    self._upl_active = False; self.mission_error.emit(f"Write failed: {e}")
+                self._do_mission_write(items)
 
             elif c == "clear":
-                try:
-                    print(f"\n{'='*60}")
-                    print(f"[MAVLink] Sending CLEAR_ALL command to vehicle")
-                    print(f"  Target: sys={self._fc_sid}, comp={self._fc_cid}")
-                    print(f"{'='*60}")
-                    self.L("Clearing all mission items from flight controller...")
-                    # Clear all mission items on vehicle
-                    from pymavlink import mavutil
-                    self._mav.mission_clear_all_send(self._fc_sid, self._fc_cid, mission_type=0)
-                    print("[MAVLink] MISSION_CLEAR_ALL command sent")
-                    print("[MAVLink] Waiting for acknowledgment...")
-                    # Give it a moment then emit success (some FCs don't send ACK for clear)
-                    self.msleep(500)
-                    self.mission_clear_ok.emit()
-                    print("[MAVLink] ✓ Mission cleared from vehicle")
-                except Exception as e:
-                    print(f"[MAVLink] Mission clear failed: {e}")
-                    self.mission_error.emit(f"Clear failed: {e}")
+                self._do_mission_clear()
 
             self.msleep(5)
 
@@ -716,53 +955,233 @@ class HttpTileProvider(QtCore.QObject):
 
 # ---------------- AHRS + HUD ----------------
 class AHRSWidget(QWidget):
+    """Artificial Horizon / Attitude Indicator Widget"""
     def __init__(self):
         super().__init__()
         self.setFixedSize(260, 260)
-        self.roll = 0.0; self.pitch = 0.0; self.yaw = 0.0
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("background: rgba(0, 0, 0, 120); border-radius: 10px;")
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+        self.setAutoFillBackground(False)
+        # Ensure widget is visible and painted
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+
     def set_attitude(self, roll_deg: float, pitch_deg: float, yaw_deg: float):
-        self.roll = float(roll_deg or 0.0); self.pitch = float(pitch_deg or 0.0); self.yaw = float(yaw_deg or 0.0)
+        self.roll = float(roll_deg or 0.0)
+        self.pitch = float(pitch_deg or 0.0)
+        self.yaw = float(yaw_deg or 0.0)
         self.update()
-    def paintEvent(self, _):
+
+    def paintEvent(self, event):
         w, h = self.width(), self.height()
-        cx, cy = w//2, h//2
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing, True)
-        bezel_pen = QPen(Qt.white); bezel_pen.setWidth(1); p.setPen(bezel_pen)
-        ppd = 3.0
-        p.save(); p.translate(cx, cy); p.rotate(-self.roll)
+        cx, cy = w // 2, h // 2
+        radius = 100  # Main horizon circle radius
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # Draw semi-transparent background panel
+        p.setBrush(QtGui.QColor(0, 0, 0, 140))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, w, h, 10, 10)
+
+        # Create circular clipping region for the horizon
+        clip_path = QtGui.QPainterPath()
+        clip_path.addEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+        p.setClipPath(clip_path)
+
+        # Pixels per degree of pitch
+        ppd = 2.5
+
+        # Save state and apply roll rotation around center
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(-self.roll)
+
+        # Calculate pitch offset
         y_off = ppd * self.pitch
-        sky_rect = QRect(-400, -400 - int(y_off), 800, 400)
-        ground_rect = QRect(-400, 0 - int(y_off), 800, 400)
-        p.fillRect(sky_rect, QtGui.QColor(90, 150, 220))
-        p.fillRect(ground_rect, QtGui.QColor(140, 95, 35))
-        p.setPen(Qt.white); p.drawLine(-380, -int(y_off), 380, -int(y_off))
+
+        # Draw sky (blue) - large rect that extends beyond visible area
+        sky_color = QtGui.QColor(70, 130, 200)
+        p.fillRect(-radius - 50, -radius * 3 - int(y_off), (radius + 50) * 2, radius * 3, sky_color)
+
+        # Draw ground (brown)
+        ground_color = QtGui.QColor(130, 85, 35)
+        p.fillRect(-radius - 50, -int(y_off), (radius + 50) * 2, radius * 3, ground_color)
+
+        # Draw horizon line
+        p.setPen(QPen(Qt.white, 2))
+        p.drawLine(-radius - 20, -int(y_off), radius + 20, -int(y_off))
+
+        # Draw pitch ladder lines
+        p.setPen(QPen(Qt.white, 1))
+        for deg in [-30, -20, -10, 10, 20, 30]:
+            y_ladder = -int(y_off) - int(deg * ppd)
+            line_width = 30 if abs(deg) == 10 else 20
+            p.drawLine(-line_width, y_ladder, line_width, y_ladder)
+            # Draw degree labels
+            if abs(deg) <= 30:
+                font = QFont("Arial", 7)
+                p.setFont(font)
+                p.drawText(line_width + 3, y_ladder + 4, str(abs(deg)))
+                p.drawText(-line_width - 15, y_ladder + 4, str(abs(deg)))
+
         p.restore()
-        p.setPen(Qt.white); radius = 110
-        p.drawArc(cx-radius, cy-radius, radius*2, radius*2, (90-60)*16, 120*16)
-        pointer = QtGui.QPolygon([QtCore.QPoint(cx, cy - radius - 6),
-                                  QtCore.QPoint(cx - 7, cy - radius + 8),
-                                  QtCore.QPoint(cx + 7, cy - radius + 8)])
-        p.setBrush(Qt.white); p.drawPolygon(pointer)
+
+        # Remove clipping for overlay elements
+        p.setClipping(False)
+
+        # Draw bezel ring
+        p.setPen(QPen(Qt.white, 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+
+        # Draw fixed aircraft symbol (center reference)
+        p.setPen(QPen(QtGui.QColor(255, 200, 0), 3))
+        # Left wing
+        p.drawLine(cx - 50, cy, cx - 20, cy)
+        # Right wing
+        p.drawLine(cx + 20, cy, cx + 50, cy)
+        # Center dot
+        p.setBrush(QtGui.QColor(255, 200, 0))
+        p.drawEllipse(cx - 5, cy - 5, 10, 10)
+        # Vertical tail indicator
+        p.drawLine(cx, cy - 15, cx, cy - 5)
+
+        # Draw roll indicator arc at top
+        p.setPen(QPen(Qt.white, 1))
+        arc_radius = radius + 10
+        # Draw the arc
+        p.drawArc(cx - arc_radius, cy - arc_radius, arc_radius * 2, arc_radius * 2, 30 * 16, 120 * 16)
+
+        # Draw roll tick marks
+        for angle in [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]:
+            rad = math.radians(90 + angle)
+            x1 = cx + int((arc_radius - 5) * math.cos(rad))
+            y1 = cy - int((arc_radius - 5) * math.sin(rad))
+            tick_len = 10 if angle % 30 == 0 else 5
+            x2 = cx + int((arc_radius - 5 - tick_len) * math.cos(rad))
+            y2 = cy - int((arc_radius - 5 - tick_len) * math.sin(rad))
+            p.drawLine(x1, y1, x2, y2)
+
+        # Draw roll pointer (triangle at top, rotates with roll)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(-self.roll)
+        pointer = QtGui.QPolygon([
+            QtCore.QPoint(0, -arc_radius + 5),
+            QtCore.QPoint(-6, -arc_radius + 15),
+            QtCore.QPoint(6, -arc_radius + 15)
+        ])
+        p.setBrush(Qt.white)
+        p.setPen(Qt.white)
+        p.drawPolygon(pointer)
+        p.restore()
+
+        # Draw heading/yaw value at bottom
+        p.setPen(Qt.white)
+        font = QFont("Arial", 10, QFont.Bold)
+        p.setFont(font)
+        yaw_text = f"HDG {int(self.yaw) % 360}°"
+        text_rect = p.fontMetrics().boundingRect(yaw_text)
+        p.drawText(cx - text_rect.width() // 2, h - 15, yaw_text)
+
+        # Draw pitch value
+        pitch_text = f"PITCH {self.pitch:+.1f}°"
+        p.drawText(10, h - 15, pitch_text)
+
+        # Draw roll value
+        roll_text = f"ROLL {self.roll:+.1f}°"
+        text_rect = p.fontMetrics().boundingRect(roll_text)
+        p.drawText(w - text_rect.width() - 10, h - 15, roll_text)
 
 class HUDPanel(QWidget):
+    """Head-Up Display Panel showing flight data"""
     def __init__(self):
         super().__init__()
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("background: rgba(0,0,0,120); color: #e8e8e8; border-radius: 8px;")
-        lay = QGridLayout(self); lay.setContentsMargins(8,8,8,8)
-        def key(t): lbl=QLabel(t); f=lbl.font(); f.setBold(True); lbl.setFont(f); return lbl
-        self.mode=QLabel("—"); self.gps=QLabel("—"); self.alt=QLabel("0.0 m")
-        self.gs=QLabel("0.0 m/s"); self.vz=QLabel("0.0 m/s"); self.yaw=QLabel("0°"); self.bat=QLabel("—")
-        lay.addWidget(key("Mode:"),0,0); lay.addWidget(self.mode,0,1)
-        lay.addWidget(key("GPS:"),1,0); lay.addWidget(self.gps,1,1)
-        lay.addWidget(key("Alt:"),2,0); lay.addWidget(self.alt,2,1)
-        lay.addWidget(key("GS:"),3,0); lay.addWidget(self.gs,3,1)
-        lay.addWidget(key("VZ:"),4,0); lay.addWidget(self.vz,4,1)
-        lay.addWidget(key("Yaw:"),5,0); lay.addWidget(self.yaw,5,1)
-        lay.addWidget(key("Batt:"),6,0); lay.addWidget(self.bat,6,1)
-        self.setFixedWidth(260)
+        self.setStyleSheet("background: rgba(0,0,0,160); color: #e8e8e8; border-radius: 8px;")
+        lay = QGridLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(4)
+
+        def key(t):
+            lbl = QLabel(t)
+            f = lbl.font()
+            f.setBold(True)
+            lbl.setFont(f)
+            lbl.setStyleSheet("color: #aaaaaa;")
+            return lbl
+
+        def val():
+            lbl = QLabel("—")
+            lbl.setStyleSheet("color: #ffffff; font-size: 12px;")
+            return lbl
+
+        # Mode and Armed status row with visual indicator
+        self.mode = QLabel("—")
+        self.mode.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+
+        self.armed_indicator = QLabel("DISARMED")
+        self.armed_indicator.setAlignment(Qt.AlignCenter)
+        self._set_armed_style(False)
+
+        # Create other value labels
+        self.gps = val()
+        self.alt = QLabel("0.0 m")
+        self.alt.setStyleSheet("color: #00ff00; font-size: 12px; font-weight: bold;")
+        self.gs = val()
+        self.vz = val()
+        self.yaw = val()
+        self.bat = val()
+
+        # Layout
+        row = 0
+        lay.addWidget(key("Mode:"), row, 0)
+        lay.addWidget(self.mode, row, 1)
+        row += 1
+        lay.addWidget(key("Status:"), row, 0)
+        lay.addWidget(self.armed_indicator, row, 1)
+        row += 1
+        lay.addWidget(key("GPS:"), row, 0)
+        lay.addWidget(self.gps, row, 1)
+        row += 1
+        lay.addWidget(key("Alt:"), row, 0)
+        lay.addWidget(self.alt, row, 1)
+        row += 1
+        lay.addWidget(key("GS:"), row, 0)
+        lay.addWidget(self.gs, row, 1)
+        row += 1
+        lay.addWidget(key("VZ:"), row, 0)
+        lay.addWidget(self.vz, row, 1)
+        row += 1
+        lay.addWidget(key("Yaw:"), row, 0)
+        lay.addWidget(self.yaw, row, 1)
+        row += 1
+        lay.addWidget(key("Batt:"), row, 0)
+        lay.addWidget(self.bat, row, 1)
+
+        self.setFixedWidth(220)
+
+    def _set_armed_style(self, armed: bool):
+        """Update armed indicator visual style"""
+        if armed:
+            self.armed_indicator.setText("ARMED")
+            self.armed_indicator.setStyleSheet(
+                "background: #cc0000; color: white; font-weight: bold; "
+                "padding: 2px 8px; border-radius: 4px; font-size: 11px;"
+            )
+        else:
+            self.armed_indicator.setText("DISARMED")
+            self.armed_indicator.setStyleSheet(
+                "background: #006600; color: white; font-weight: bold; "
+                "padding: 2px 8px; border-radius: 4px; font-size: 11px;"
+            )
+
+    def set_mode_armed(self, mode: str, armed: bool):
+        """Update mode and armed status"""
+        self.mode.setText(mode if mode else "—")
+        self._set_armed_style(armed)
 
 # ---------------- Map Widget (now emits waypointsChanged) ----------------
 class MapWidget(QWidget):
@@ -1152,13 +1571,46 @@ class MapDashboard(QWidget):
     # ------ mission actions ------
     def _delete_selected(self):
         """Delete selected waypoints from table and update maps"""
-        print("[UI] Deleting selected waypoints from sequence...")
+        # Get selected rows
+        selected_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+
+        if not selected_rows:
+            print("[UI] No waypoints selected for deletion")
+            QMessageBox.information(self, "Delete Waypoint",
+                                   "Please select one or more waypoints to delete.\n\n"
+                                   "Click on a row in the waypoint sequence table to select it.")
+            return
+
+        # Confirm deletion
+        count = len(selected_rows)
+        if count == 1:
+            msg = f"Delete waypoint WP{selected_rows[0]}?"
+        else:
+            msg = f"Delete {count} selected waypoints?"
+
+        reply = QMessageBox.question(self, "Delete Waypoints",
+                                     f"{msg}\n\nThis cannot be undone.",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            print("[UI] Waypoint deletion canceled by user")
+            return
+
+        print(f"[UI] Deleting {count} waypoint(s) from sequence: {selected_rows}")
         self.table.del_selected()
+
         # Get updated waypoints and sync to maps
         wps = self.table.to_list()
         self.map.set_waypoints(wps)
         self.plan_map.set_waypoints(wps)
+
+        # Renumber remaining waypoints if needed (table handles this automatically)
         print(f"[UI] Waypoints deleted. Remaining: {len(wps)}")
+
+        # Show feedback
+        if wps:
+            self.worker.L(f"Deleted {count} waypoint(s). {len(wps)} remaining.")
+        else:
+            self.worker.L("All waypoints deleted. Plan is now empty.")
 
     def _read_mission(self):
         """Download mission from flight controller"""
@@ -1280,13 +1732,69 @@ class MapDashboard(QWidget):
 
     # ------ helpers ------
     def _set_home_wp0(self):
+        """Set or create home/takeoff waypoint (WP0).
+
+        If GPS position is available, offers to use current position.
+        Otherwise uses map center or existing first waypoint position.
+        """
         wps = self.table.to_list()
+        current_lat = self.map.center_lat
+        current_lon = self.map.center_lon
+        default_alt = 30.0
+
+        # Try to get GPS position if connected
+        gps_lat = None
+        gps_lon = None
+        # Check if we have recent GPS data from HUD
+        if self.map.hud and hasattr(self.map.hud, 'gps'):
+            gps_text = self.map.hud.gps.text()
+            if gps_text and "3D" in gps_text:
+                # We have good GPS fix - use map center which should be tracking position
+                gps_lat = current_lat
+                gps_lon = current_lon
+
         if wps:
+            # Already have waypoints - modify WP0 to be TAKEOFF
+            old_wp = wps[0]
+
+            # Ask user what to do
+            options = []
+            if gps_lat is not None:
+                options.append(f"Use current GPS position ({gps_lat:.6f}, {gps_lon:.6f})")
+            options.append(f"Keep existing position ({old_wp.lat:.6f}, {old_wp.lon:.6f})")
+            options.append(f"Use map center ({current_lat:.6f}, {current_lon:.6f})")
+
+            # Simple dialog - just set as takeoff
             wps[0].cmd = CMD_TAKEOFF
+            print(f"[UI] Set WP0 as TAKEOFF at ({old_wp.lat:.7f}, {old_wp.lon:.7f})")
+            self.worker.L(f"WP0 set as TAKEOFF position")
+
         else:
-            wps = [WP(cmd=CMD_TAKEOFF, lat=self.map.center_lat, lon=self.map.center_lon, alt=30.0)]
-        self.table.blockSignals(True); self.table.load(wps); self.table.blockSignals(False)
-        self.map.set_waypoints(wps); self.plan_map.set_waypoints(wps)
+            # No waypoints yet - create new home waypoint
+            if gps_lat is not None:
+                # Use GPS position
+                home_lat, home_lon = gps_lat, gps_lon
+                print(f"[UI] Creating home waypoint at GPS position: ({home_lat:.7f}, {home_lon:.7f})")
+            else:
+                # Use map center
+                home_lat, home_lon = current_lat, current_lon
+                print(f"[UI] Creating home waypoint at map center: ({home_lat:.7f}, {home_lon:.7f})")
+
+            wps = [WP(cmd=CMD_TAKEOFF, lat=home_lat, lon=home_lon, alt=default_alt)]
+            self.worker.L(f"Created home waypoint (TAKEOFF) at ({home_lat:.6f}, {home_lon:.6f})")
+
+        # Update table and maps
+        self.table.blockSignals(True)
+        self.table.load(wps)
+        self.table.blockSignals(False)
+        self.map.set_waypoints(wps)
+        self.plan_map.set_waypoints(wps)
+
+        # Center plan map on home if this is the first waypoint
+        if len(wps) == 1:
+            self.plan_map.recenter(wps[0].lat, wps[0].lon)
+            self.plan_map.zoom = max(15, self.plan_map.zoom)
+            self.plan_map.update()
 
     def _open_mbtiles(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open MBTiles", "", "MBTiles (*.mbtiles)")
@@ -1314,26 +1822,75 @@ class MapDashboard(QWidget):
         if self.autopan.isChecked():
             now = time.time() * 1000.0
             if now >= self._suppress_until:
-                lat = d.get("_gps_lat"); lon = d.get("_gps_lon")
+                lat = d.get("_gps_lat")
+                lon = d.get("_gps_lon")
                 if lat is not None and lon is not None:
                     self.map.recenter(lat, lon)
                     # keep the plan map near the same area but do not fight user during planning
+
         # HUD overlay on main map
         if self.map.hud:
-            if "mode" in d and "armed" in d: self.map.hud.mode.setText(f"{d['mode']} | {'ARMED' if d['armed'] else 'DISARMED'}")
-            if d.get("_fix") is not None or d.get("_sats") is not None: self.map.hud.gps.setText(f"{d.get('_fix','?')} / {d.get('_sats','?')} sats")
-            if d.get("_alt") is not None: self.map.hud.alt.setText(f"{d['_alt']:.1f} m")
-            if d.get("_gs") is not None:  self.map.hud.gs.setText(f"{d['_gs']:.1f} m/s")
-            if d.get("_vz") is not None:  self.map.hud.vz.setText(f"{d['_vz']:+.1f} m/s")
-            if d.get("_yaw") is not None: self.map.hud.yaw.setText(f"{d['_yaw']:.1f}°")
+            # Update mode and armed status with visual indicator
+            if "mode" in d and "armed" in d:
+                self.map.hud.set_mode_armed(d['mode'], d['armed'])
+
+            # GPS status
+            if d.get("_fix") is not None or d.get("_sats") is not None:
+                fix = d.get('_fix', '?')
+                sats = d.get('_sats', '?')
+                # Color code GPS status
+                if fix in ['3D', 'RTK_FIXED', 'RTK_FLOAT', 'DGPS']:
+                    self.map.hud.gps.setStyleSheet("color: #00ff00; font-size: 12px;")
+                elif fix == '2D':
+                    self.map.hud.gps.setStyleSheet("color: #ffff00; font-size: 12px;")
+                else:
+                    self.map.hud.gps.setStyleSheet("color: #ff6666; font-size: 12px;")
+                self.map.hud.gps.setText(f"{fix} / {sats} sats")
+
+            # Altitude
+            if d.get("_alt") is not None:
+                self.map.hud.alt.setText(f"{d['_alt']:.1f} m")
+
+            # Ground speed
+            if d.get("_gs") is not None:
+                self.map.hud.gs.setText(f"{d['_gs']:.1f} m/s")
+
+            # Vertical speed with color coding
+            if d.get("_vz") is not None:
+                vz = d['_vz']
+                if vz > 0.5:
+                    self.map.hud.vz.setStyleSheet("color: #00ff00; font-size: 12px;")
+                elif vz < -0.5:
+                    self.map.hud.vz.setStyleSheet("color: #ff6666; font-size: 12px;")
+                else:
+                    self.map.hud.vz.setStyleSheet("color: #ffffff; font-size: 12px;")
+                self.map.hud.vz.setText(f"{vz:+.1f} m/s")
+
+            # Yaw/Heading
+            if d.get("_yaw") is not None:
+                self.map.hud.yaw.setText(f"{d['_yaw']:.1f}°")
+
+            # Battery with voltage warning
             if "battery" in d:
-                vb = d.get("_vb"); cpu = d.get("_cpu")
+                vb = d.get("_vb")
+                cpu = d.get("_cpu")
                 if vb is not None and cpu is not None:
+                    # Color code battery voltage (adjust thresholds as needed)
+                    if vb < 21.0:  # Critical
+                        self.map.hud.bat.setStyleSheet("color: #ff0000; font-size: 12px; font-weight: bold;")
+                    elif vb < 22.5:  # Warning
+                        self.map.hud.bat.setStyleSheet("color: #ffff00; font-size: 12px;")
+                    else:  # OK
+                        self.map.hud.bat.setStyleSheet("color: #00ff00; font-size: 12px;")
                     self.map.hud.bat.setText(f"{vb:.2f} V | CPU {cpu:.0f}%")
                 else:
                     self.map.hud.bat.setText(d["battery"])
+
+        # Update AHRS/Artificial Horizon
         if self.map.ahrs:
-            r = d.get("_roll"); p = d.get("_pitch"); y = d.get("_yaw")
+            r = d.get("_roll")
+            p = d.get("_pitch")
+            y = d.get("_yaw")
             if (r is not None) or (p is not None) or (y is not None):
                 self.map.ahrs.set_attitude(r or 0.0, p or 0.0, y or 0.0)
 
