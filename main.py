@@ -198,8 +198,10 @@ class MavWorker(QThread):
     # --------- helpers ----------
     @staticmethod
     def _to_mission_int(seq: int, wp: WP, target_sys: int, target_comp: int, mavutil, mav):
+        """Convert WP to MISSION_ITEM_INT message (compatible with older pymavlink)"""
         lat_i = int(round(wp.lat * 1e7))
         lon_i = int(round(wp.lon * 1e7))
+        # Note: mission_type parameter removed for compatibility with older pymavlink versions
         return mavutil.mavlink.MAVLink_mission_item_int_message(
             target_system=target_sys,
             target_component=target_comp,
@@ -208,9 +210,13 @@ class MavWorker(QThread):
             command=wp.cmd,
             current=1 if seq == 0 else 0,
             autocontinue=1,
-            param1=float(wp.p1), param2=float(wp.p2), param3=float(wp.p3), param4=float(wp.p4),
-            x=lat_i, y=lon_i, z=float(wp.alt),
-            mission_type=0
+            param1=float(wp.p1),
+            param2=float(wp.p2),
+            param3=float(wp.p3),
+            param4=float(wp.p4),
+            x=lat_i,
+            y=lon_i,
+            z=float(wp.alt)
         )
 
     @staticmethod
@@ -246,7 +252,7 @@ class MavWorker(QThread):
             self._dl_start_time = time.time()
 
             # Request mission list - vehicle will respond with MISSION_COUNT
-            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid)
 
             print(f"[MAVLink] MISSION_REQUEST_LIST sent")
             print(f"[MAVLink] Waiting for MISSION_COUNT response...")
@@ -290,7 +296,7 @@ class MavWorker(QThread):
             self._upl_retry_count = 0
 
             # Send mission count to start upload protocol
-            self._mav.mission_count_send(self._fc_sid, self._fc_cid, len(items), mission_type=0)
+            self._mav.mission_count_send(self._fc_sid, self._fc_cid, len(items))
 
             print(f"\n[MAVLink] MISSION_COUNT sent: {len(items)} waypoints")
             print(f"[MAVLink] Waiting for vehicle to request waypoints...")
@@ -315,7 +321,7 @@ class MavWorker(QThread):
             self._clear_pending = True
 
             # Send clear command
-            self._mav.mission_clear_all_send(self._fc_sid, self._fc_cid, mission_type=0)
+            self._mav.mission_clear_all_send(self._fc_sid, self._fc_cid)
             print("[MAVLink] MISSION_CLEAR_ALL command sent")
 
             # Wait for ACK or timeout
@@ -323,7 +329,7 @@ class MavWorker(QThread):
 
             # Verify by requesting mission count
             print("[MAVLink] Verifying mission clear...")
-            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid)
 
             # Wait for count response
             verify_start = time.time()
@@ -363,14 +369,14 @@ class MavWorker(QThread):
             print(f"[MAVLink] Requesting waypoint {self._dl_next_seq + 1}/{self._dl_expected}...")
             self._mav.mission_request_int_send(
                 self._fc_sid, self._fc_cid,
-                self._dl_next_seq, mission_type=0
+                self._dl_next_seq
             )
 
     def _verify_mission_upload(self):
         """Verify uploaded mission by requesting count from vehicle"""
         try:
             print(f"\n[MAVLink] Verifying upload...")
-            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid, mission_type=0)
+            self._mav.mission_request_list_send(self._fc_sid, self._fc_cid)
 
             verify_start = time.time()
             while (time.time() - verify_start) < 3.0:
@@ -609,7 +615,7 @@ class MavWorker(QThread):
 
                     if len(self._dl_got) == self._dl_expected:
                         # All waypoints received - send ACK and complete
-                        self._mav.mission_ack_send(self._fc_sid, self._fc_cid, 0, mission_type=0)
+                        self._mav.mission_ack_send(self._fc_sid, self._fc_cid, 0)
                         self._dl_active = False
                         self._dl_start_time = 0
                         print(f"\n{'='*60}")
