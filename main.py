@@ -1197,13 +1197,13 @@ class PathPlanner:
     This class generates a survey flight path inside a polygon boundary.
     The path consists of parallel lines (rows) that cover the entire area.
 
-    How it works:
+    Features:
     1. Takes a boundary polygon (yellow zone) as input
-    2. Calculates the bounding box of the polygon
-    3. Generates parallel survey lines at the specified row width
-    4. Clips lines to stay inside the polygon boundary
-    5. Connects lines in a boustrophedon (back-and-forth) pattern
-    6. Returns waypoints for the complete coverage path
+    2. Avoids red zones (no-fly areas)
+    3. Respects user-defined start and end points
+    4. Generates parallel survey lines at the specified row width
+    5. Clips lines to stay inside the boundary and outside red zones
+    6. Connects lines in a boustrophedon (back-and-forth) pattern
     """
 
     @staticmethod
@@ -1246,6 +1246,8 @@ class PathPlanner:
         Returns True if point (x, y) is inside the polygon.
         """
         n = len(polygon)
+        if n < 3:
+            return False
         inside = False
 
         j = n - 1
@@ -1258,6 +1260,19 @@ class PathPlanner:
             j = i
 
         return inside
+
+    @staticmethod
+    def point_in_any_red_zone(lat: float, lon: float, red_zones: List[List[Tuple[float, float]]]) -> bool:
+        """
+        Check if a point is inside any of the red zones.
+        Returns True if point is in a no-fly area.
+        """
+        for red_zone in red_zones:
+            # Red zone uses (lat, lon), convert to (lon, lat) for x, y
+            polygon = [(rz_lon, rz_lat) for rz_lat, rz_lon in red_zone]
+            if PathPlanner.point_in_polygon(lon, lat, polygon):
+                return True
+        return False
 
     @staticmethod
     def line_polygon_intersections(y: float, polygon: List[Tuple[float, float]]) -> List[float]:
@@ -1281,35 +1296,79 @@ class PathPlanner:
         return sorted(intersections)
 
     @staticmethod
+    def clip_segment_around_red_zones(
+        lat: float,
+        lon_start: float,
+        lon_end: float,
+        red_zones: List[List[Tuple[float, float]]],
+        step_size: float = 0.00001  # ~1 meter
+    ) -> List[Tuple[float, float]]:
+        """
+        Clip a horizontal line segment to avoid red zones.
+        Returns list of (lon_start, lon_end) segments that are outside red zones.
+        """
+        if not red_zones:
+            return [(lon_start, lon_end)]
+
+        # Ensure lon_start < lon_end
+        if lon_start > lon_end:
+            lon_start, lon_end = lon_end, lon_start
+
+        valid_segments = []
+        current_start = None
+        lon = lon_start
+
+        while lon <= lon_end:
+            in_red = PathPlanner.point_in_any_red_zone(lat, lon, red_zones)
+
+            if not in_red:
+                if current_start is None:
+                    current_start = lon
+            else:
+                if current_start is not None:
+                    valid_segments.append((current_start, lon - step_size))
+                    current_start = None
+
+            lon += step_size
+
+        # Close last segment
+        if current_start is not None:
+            valid_segments.append((current_start, lon_end))
+
+        return valid_segments
+
+    @staticmethod
     def generate_coverage_path(
         boundary: List[Tuple[float, float]],  # List of (lat, lon) tuples
         row_width_meters: float = 10.0,
         altitude: float = 30.0,
-        angle_deg: float = 0.0  # Survey angle (0 = North-South lines)
+        angle_deg: float = 0.0,  # Survey angle (0 = North-South lines)
+        red_zones: List[List[Tuple[float, float]]] = None,  # List of no-fly polygons
+        start_point: Tuple[float, float] = None,  # (lat, lon) start point
+        end_point: Tuple[float, float] = None,  # (lat, lon) end point
     ) -> Tuple[List[WP], dict]:
         """
         Generate a coverage path (lawnmower pattern) inside the boundary polygon.
 
         Args:
-            boundary: List of (lat, lon) tuples defining the polygon
+            boundary: List of (lat, lon) tuples defining the survey area (yellow zone)
             row_width_meters: Distance between parallel survey lines in meters
             altitude: Flight altitude in meters
             angle_deg: Survey line angle (0=N-S, 90=E-W)
+            red_zones: List of polygons defining no-fly areas (red zones)
+            start_point: Optional (lat, lon) where path should start
+            end_point: Optional (lat, lon) where path should end
 
         Returns:
             Tuple of (waypoints list, statistics dict)
-
-        Algorithm:
-        1. Calculate bounding box of the polygon
-        2. Generate parallel lines from south to north (or rotated)
-        3. For each line, find intersection points with polygon
-        4. Create waypoints at intersection points
-        5. Connect lines in alternating directions (boustrophedon)
         """
         planner = PathPlanner
-        planner.log("=" * 50)
+        planner.log("=" * 60)
         planner.log("COVERAGE PATH GENERATION STARTED")
-        planner.log("=" * 50)
+        planner.log("=" * 60)
+
+        if red_zones is None:
+            red_zones = []
 
         if len(boundary) < 3:
             planner.log("ERROR: Boundary must have at least 3 points!")
@@ -1320,6 +1379,15 @@ class PathPlanner:
         planner.log(f"  - Row width: {row_width_meters} meters")
         planner.log(f"  - Altitude: {altitude} meters")
         planner.log(f"  - Survey angle: {angle_deg} degrees")
+        planner.log(f"  - Red zones (no-fly areas): {len(red_zones)}")
+        if start_point:
+            planner.log(f"  - Start point: ({start_point[0]:.7f}, {start_point[1]:.7f})")
+        if end_point:
+            planner.log(f"  - End point: ({end_point[0]:.7f}, {end_point[1]:.7f})")
+
+        # Log red zones info
+        for i, rz in enumerate(red_zones):
+            planner.log(f"  - Red Zone {i+1}: {len(rz)} points")
 
         # Extract coordinates
         lats = [p[0] for p in boundary]
@@ -1354,42 +1422,105 @@ class PathPlanner:
         # Create polygon for intersection tests (using lon, lat order for x, y)
         polygon = [(lon, lat) for lat, lon in boundary]
 
-        waypoints = []
-        total_lines = 0
-        go_right = True  # Direction alternates for boustrophedon pattern
-
-        # Generate survey lines from south to north
+        # Generate all survey lines first
+        all_lines = []  # List of (lat, [(lon1, lon2), ...]) for each line
         planner.log("Generating Survey Lines:")
         current_lat = min_lat + row_width_lat / 2  # Start half row-width from edge
 
         while current_lat <= max_lat:
-            # Find intersections with polygon at this latitude
+            # Find intersections with boundary polygon at this latitude
             intersections = planner.line_polygon_intersections(current_lat, polygon)
 
             if len(intersections) >= 2:
-                # We have valid intersection points
-                # Take pairs of intersections (entry and exit points)
+                # Get boundary segments
+                segments = []
                 for i in range(0, len(intersections) - 1, 2):
                     x_start = intersections[i]
                     x_end = intersections[i + 1] if i + 1 < len(intersections) else intersections[i]
+                    segments.append((x_start, x_end))
 
-                    # Create waypoints at the intersection points
-                    if go_right:
-                        wp1_lon, wp2_lon = x_start, x_end
-                    else:
-                        wp1_lon, wp2_lon = x_end, x_start
+                # Clip each segment around red zones
+                valid_segments = []
+                for seg_start, seg_end in segments:
+                    clipped = planner.clip_segment_around_red_zones(
+                        current_lat, seg_start, seg_end, red_zones,
+                        step_size=row_width_lon / 10  # Use 1/10 of row width for precision
+                    )
+                    valid_segments.extend(clipped)
 
-                    # Add waypoints for this line segment
-                    waypoints.append(WP(cmd=CMD_WAYPOINT, lat=current_lat, lon=wp1_lon, alt=altitude))
-                    waypoints.append(WP(cmd=CMD_WAYPOINT, lat=current_lat, lon=wp2_lon, alt=altitude))
-
-                    total_lines += 1
-                    planner.log(f"  Line {total_lines}: Lat={current_lat:.7f}, "
-                               f"Lon {wp1_lon:.7f} -> {wp2_lon:.7f}")
-
-                go_right = not go_right  # Alternate direction
+                if valid_segments:
+                    all_lines.append((current_lat, valid_segments))
 
             current_lat += row_width_lat
+
+        planner.log(f"  - Total survey lines generated: {len(all_lines)}")
+
+        # Determine path direction based on start point
+        reverse_order = False
+        if start_point and all_lines:
+            # Check if start point is closer to first or last line
+            first_line_lat = all_lines[0][0]
+            last_line_lat = all_lines[-1][0]
+            dist_to_first = abs(start_point[0] - first_line_lat)
+            dist_to_last = abs(start_point[0] - last_line_lat)
+            if dist_to_last < dist_to_first:
+                reverse_order = True
+                planner.log(f"  - Reversing line order (start point closer to last line)")
+
+        if reverse_order:
+            all_lines = all_lines[::-1]
+
+        # Build waypoints with boustrophedon pattern
+        waypoints = []
+        total_lines = 0
+        skipped_red = 0
+
+        for line_idx, (lat, segments) in enumerate(all_lines):
+            go_right = (line_idx % 2 == 0)
+
+            # Determine start direction based on start point for first line
+            if line_idx == 0 and start_point and segments:
+                # Check which end of first segment is closer to start point
+                first_seg = segments[0]
+                last_seg = segments[-1]
+                dist_to_left = abs(start_point[1] - first_seg[0])
+                dist_to_right = abs(start_point[1] - last_seg[1])
+                go_right = dist_to_right > dist_to_left
+
+            for seg_start, seg_end in (segments if go_right else reversed(segments)):
+                if go_right:
+                    wp1_lon, wp2_lon = seg_start, seg_end
+                else:
+                    wp1_lon, wp2_lon = seg_end, seg_start
+
+                # Verify waypoints are not in red zones
+                if not planner.point_in_any_red_zone(lat, wp1_lon, red_zones):
+                    waypoints.append(WP(cmd=CMD_WAYPOINT, lat=lat, lon=wp1_lon, alt=altitude))
+                else:
+                    skipped_red += 1
+
+                if not planner.point_in_any_red_zone(lat, wp2_lon, red_zones):
+                    waypoints.append(WP(cmd=CMD_WAYPOINT, lat=lat, lon=wp2_lon, alt=altitude))
+                else:
+                    skipped_red += 1
+
+                total_lines += 1
+                planner.log(f"  Line {total_lines}: Lat={lat:.7f}, Lon {wp1_lon:.7f} -> {wp2_lon:.7f}")
+
+        if skipped_red > 0:
+            planner.log(f"  - Skipped {skipped_red} points inside red zones")
+
+        # Add start point as first waypoint if specified
+        if start_point and waypoints:
+            start_wp = WP(cmd=CMD_WAYPOINT, lat=start_point[0], lon=start_point[1], alt=altitude)
+            waypoints.insert(0, start_wp)
+            planner.log(f"  - Added START point as first waypoint")
+
+        # Add end point as last waypoint if specified
+        if end_point and waypoints:
+            end_wp = WP(cmd=CMD_WAYPOINT, lat=end_point[0], lon=end_point[1], alt=altitude)
+            waypoints.append(end_wp)
+            planner.log(f"  - Added END point as last waypoint")
 
         # Calculate statistics
         total_distance = 0.0
@@ -1409,18 +1540,26 @@ class PathPlanner:
             "row_width_m": row_width_meters,
             "area_width_m": width_m,
             "area_height_m": height_m,
+            "red_zones_count": len(red_zones),
+            "skipped_red_zone_points": skipped_red,
+            "has_start_point": start_point is not None,
+            "has_end_point": end_point is not None,
         }
 
-        planner.log("=" * 50)
+        planner.log("=" * 60)
         planner.log("PATH GENERATION COMPLETE")
-        planner.log("=" * 50)
+        planner.log("=" * 60)
         planner.log(f"Summary:")
         planner.log(f"  - Total waypoints: {len(waypoints)}")
         planner.log(f"  - Total survey lines: {total_lines}")
         planner.log(f"  - Total distance: {total_distance:.1f} meters ({total_distance/1000:.2f} km)")
         planner.log(f"  - Estimated flight time: {estimated_time:.0f} seconds ({estimated_time/60:.1f} minutes)")
-        planner.log(f"  - Coverage efficiency: {(total_lines * row_width_meters):.1f}m of {height_m:.1f}m height")
-        planner.log("=" * 50)
+        planner.log(f"  - Red zones avoided: {len(red_zones)}")
+        if start_point:
+            planner.log(f"  - Path starts at: ({start_point[0]:.7f}, {start_point[1]:.7f})")
+        if end_point:
+            planner.log(f"  - Path ends at: ({end_point[0]:.7f}, {end_point[1]:.7f})")
+        planner.log("=" * 60)
 
         return waypoints, stats
 
@@ -1430,6 +1569,8 @@ class MapWidget(QWidget):
     userInteracted = pyqtSignal(int)
     waypointsChanged = pyqtSignal(list)  # emits List[WP] whenever WPs change on this map
     boundaryChanged = pyqtSignal(list)   # emits boundary polygon when changed
+    redZonesChanged = pyqtSignal(list)   # emits red zones when changed
+    startEndChanged = pyqtSignal(object, object)  # emits (start_point, end_point)
 
     def __init__(self, status_provider=lambda: None, show_overlays: bool = True):
         super().__init__()
@@ -1451,6 +1592,17 @@ class MapWidget(QWidget):
         # Boundary polygon for path planning (yellow zone)
         self._boundary: List[Tuple[float, float]] = []  # List of (lat, lon)
         self.boundary_mode = False  # Mode for drawing boundary
+
+        # Red zones - no-fly areas (list of polygons)
+        self._red_zones: List[List[Tuple[float, float]]] = []  # List of polygons
+        self._current_red_zone: List[Tuple[float, float]] = []  # Currently being drawn
+        self.red_zone_mode = False  # Mode for drawing red zones
+
+        # Start and End points for path planning
+        self._start_point: Optional[Tuple[float, float]] = None  # (lat, lon)
+        self._end_point: Optional[Tuple[float, float]] = None  # (lat, lon)
+        self.start_point_mode = False  # Mode for setting start point
+        self.end_point_mode = False  # Mode for setting end point
 
         # Generated path (green lines)
         self._generated_path: List[WP] = []
@@ -1489,9 +1641,52 @@ class MapWidget(QWidget):
         """Enable/disable boundary drawing mode"""
         self.boundary_mode = enabled
         if enabled:
+            self._disable_other_modes('boundary')
             print("[Map] Boundary drawing mode ENABLED - Click to add boundary points")
         else:
             print("[Map] Boundary drawing mode DISABLED")
+
+    def set_red_zone_mode(self, enabled: bool):
+        """Enable/disable red zone (no-fly area) drawing mode"""
+        self.red_zone_mode = enabled
+        if enabled:
+            self._disable_other_modes('red_zone')
+            self._current_red_zone = []  # Start new red zone
+            print("[Map] RED ZONE drawing mode ENABLED - Click to add no-fly area points")
+            print("[Map] Click at least 3 points, then finish the zone")
+        else:
+            print("[Map] RED ZONE drawing mode DISABLED")
+
+    def set_start_point_mode(self, enabled: bool):
+        """Enable/disable start point setting mode"""
+        self.start_point_mode = enabled
+        if enabled:
+            self._disable_other_modes('start')
+            print("[Map] START POINT mode ENABLED - Click on map to set start position")
+        else:
+            print("[Map] START POINT mode DISABLED")
+
+    def set_end_point_mode(self, enabled: bool):
+        """Enable/disable end point setting mode"""
+        self.end_point_mode = enabled
+        if enabled:
+            self._disable_other_modes('end')
+            print("[Map] END POINT mode ENABLED - Click on map to set end position")
+        else:
+            print("[Map] END POINT mode DISABLED")
+
+    def _disable_other_modes(self, keep_mode: str):
+        """Disable all modes except the specified one"""
+        if keep_mode != 'boundary':
+            self.boundary_mode = False
+        if keep_mode != 'red_zone':
+            self.red_zone_mode = False
+        if keep_mode != 'start':
+            self.start_point_mode = False
+        if keep_mode != 'end':
+            self.end_point_mode = False
+        if keep_mode != 'add':
+            self.add_mode = False
 
     def set_boundary(self, boundary: List[Tuple[float, float]]):
         """Set the boundary polygon"""
@@ -1508,6 +1703,87 @@ class MapWidget(QWidget):
         self._generated_path = []
         print("[Map] Boundary cleared")
         self.update()
+
+    # Red Zone methods
+    def set_red_zones(self, red_zones: List[List[Tuple[float, float]]]):
+        """Set all red zones"""
+        self._red_zones = [rz[:] for rz in red_zones]
+        self.update()
+
+    def get_red_zones(self) -> List[List[Tuple[float, float]]]:
+        """Get all red zones"""
+        return [rz[:] for rz in self._red_zones]
+
+    def add_red_zone(self, red_zone: List[Tuple[float, float]]):
+        """Add a completed red zone polygon"""
+        if len(red_zone) >= 3:
+            self._red_zones.append(red_zone[:])
+            print(f"[Map] Red zone added with {len(red_zone)} points. Total red zones: {len(self._red_zones)}")
+            self.update()
+            self.redZonesChanged.emit(self.get_red_zones())
+
+    def finish_current_red_zone(self):
+        """Finish drawing the current red zone and add it to the list"""
+        if len(self._current_red_zone) >= 3:
+            self.add_red_zone(self._current_red_zone)
+            self._current_red_zone = []
+            return True
+        else:
+            print(f"[Map] Cannot finish red zone: need at least 3 points (have {len(self._current_red_zone)})")
+            return False
+
+    def clear_red_zones(self):
+        """Clear all red zones"""
+        self._red_zones = []
+        self._current_red_zone = []
+        print("[Map] All red zones cleared")
+        self.update()
+        self.redZonesChanged.emit([])
+
+    def undo_last_red_zone(self):
+        """Remove the last added red zone"""
+        if self._red_zones:
+            self._red_zones.pop()
+            print(f"[Map] Last red zone removed. Remaining: {len(self._red_zones)}")
+            self.update()
+            self.redZonesChanged.emit(self.get_red_zones())
+
+    # Start/End point methods
+    def set_start_point(self, point: Optional[Tuple[float, float]]):
+        """Set the start point for path planning"""
+        self._start_point = point
+        if point:
+            print(f"[Map] START point set: ({point[0]:.7f}, {point[1]:.7f})")
+        else:
+            print("[Map] START point cleared")
+        self.update()
+        self.startEndChanged.emit(self._start_point, self._end_point)
+
+    def set_end_point(self, point: Optional[Tuple[float, float]]):
+        """Set the end point for path planning"""
+        self._end_point = point
+        if point:
+            print(f"[Map] END point set: ({point[0]:.7f}, {point[1]:.7f})")
+        else:
+            print("[Map] END point cleared")
+        self.update()
+        self.startEndChanged.emit(self._start_point, self._end_point)
+
+    def get_start_point(self) -> Optional[Tuple[float, float]]:
+        """Get the start point"""
+        return self._start_point
+
+    def get_end_point(self) -> Optional[Tuple[float, float]]:
+        """Get the end point"""
+        return self._end_point
+
+    def clear_start_end_points(self):
+        """Clear both start and end points"""
+        self._start_point = None
+        self._end_point = None
+        print("[Map] Start and End points cleared")
+        self.update()
+        self.startEndChanged.emit(None, None)
 
     def set_generated_path(self, path: List[WP]):
         """Set the generated coverage path (green lines)"""
@@ -1570,6 +1846,34 @@ class MapWidget(QWidget):
             tlx,tly=cx-w/2,cy-h/2
             px,py=tlx+e.pos().x(),tly+e.pos().y()
             lat,lon=self.pixels_to_latlon(px,py,self.zoom)
+
+            if self.start_point_mode:
+                # Set start point for path planning
+                self._start_point = (lat, lon)
+                print(f"[Map] START point set: Lat={lat:.7f}, Lon={lon:.7f}")
+                self.update()
+                self.startEndChanged.emit(self._start_point, self._end_point)
+                self.userInteracted.emit(3500)
+                e.accept(); return
+
+            if self.end_point_mode:
+                # Set end point for path planning
+                self._end_point = (lat, lon)
+                print(f"[Map] END point set: Lat={lat:.7f}, Lon={lon:.7f}")
+                self.update()
+                self.startEndChanged.emit(self._start_point, self._end_point)
+                self.userInteracted.emit(3500)
+                e.accept(); return
+
+            if self.red_zone_mode:
+                # Add a red zone point (no-fly area)
+                point_num = len(self._current_red_zone)
+                self._current_red_zone.append((lat, lon))
+                print(f"[Map] Added RED ZONE point R{point_num}: Lat={lat:.7f}, Lon={lon:.7f}")
+                print(f"[Map] Current red zone points: {len(self._current_red_zone)} (need at least 3 to complete)")
+                self.update()
+                self.userInteracted.emit(3500)
+                e.accept(); return
 
             if self.boundary_mode:
                 # Add a boundary point (yellow zone)
@@ -1691,6 +1995,123 @@ class MapWidget(QWidget):
                 p.drawText(sx + 8, sy - 8, label)
                 p.setPen(QtGui.QColor(255, 200, 0))
                 p.drawText(sx + 8, sy - 8, label)
+
+        # draw RED ZONES (no-fly areas)
+        for rz_idx, red_zone in enumerate(self._red_zones):
+            if len(red_zone) >= 3:
+                rz_pts = []
+                for lat, lon in red_zone:
+                    px, py = self.latlon_to_pixels(lat, lon, self.zoom)
+                    sx = int(px - tlx); sy = int(py - tly)
+                    rz_pts.append((sx, sy))
+
+                p.setRenderHint(QPainter.Antialiasing, True)
+
+                # Draw filled polygon with semi-transparent red
+                poly_points = [QtCore.QPoint(x, y) for x, y in rz_pts]
+                polygon = QtGui.QPolygon(poly_points)
+                p.setBrush(QtGui.QColor(255, 0, 0, 80))  # Semi-transparent red fill
+                p.setPen(QPen(QtGui.QColor(200, 0, 0), 2))  # Dark red border
+                p.drawPolygon(polygon)
+
+                # Draw red zone points
+                for i, (sx, sy) in enumerate(rz_pts):
+                    p.setBrush(QtGui.QColor(255, 50, 50))
+                    p.setPen(QPen(Qt.black, 1))
+                    p.drawEllipse(QtCore.QPoint(sx, sy), 4, 4)
+
+                # Draw "NO-FLY" label at center
+                if rz_pts:
+                    center_x = sum(pt[0] for pt in rz_pts) // len(rz_pts)
+                    center_y = sum(pt[1] for pt in rz_pts) // len(rz_pts)
+                    font = QFont("Arial", 8, QFont.Bold); p.setFont(font)
+                    p.setPen(QPen(Qt.white, 3))
+                    p.drawText(center_x - 20, center_y, f"NO-FLY")
+                    p.setPen(QtGui.QColor(200, 0, 0))
+                    p.drawText(center_x - 20, center_y, f"NO-FLY")
+
+        # draw current red zone being drawn (dashed red)
+        if self._current_red_zone:
+            curr_rz_pts = []
+            for lat, lon in self._current_red_zone:
+                px, py = self.latlon_to_pixels(lat, lon, self.zoom)
+                sx = int(px - tlx); sy = int(py - tly)
+                curr_rz_pts.append((sx, sy))
+
+            p.setRenderHint(QPainter.Antialiasing, True)
+
+            # Draw dashed lines
+            pen = QPen(QtGui.QColor(255, 0, 0), 2, Qt.DashLine)
+            p.setPen(pen)
+            for i in range(len(curr_rz_pts) - 1):
+                p.drawLine(curr_rz_pts[i][0], curr_rz_pts[i][1],
+                          curr_rz_pts[i+1][0], curr_rz_pts[i+1][1])
+
+            # Draw points
+            for i, (sx, sy) in enumerate(curr_rz_pts):
+                p.setBrush(QtGui.QColor(255, 100, 100))
+                p.setPen(QPen(Qt.black, 2))
+                p.drawEllipse(QtCore.QPoint(sx, sy), 5, 5)
+                # Label
+                label = f"R{i}"
+                font = QFont("Consolas", 8); font.setBold(True); p.setFont(font)
+                p.setPen(QPen(Qt.black, 2))
+                p.drawText(sx + 6, sy - 6, label)
+                p.setPen(QtGui.QColor(255, 50, 50))
+                p.drawText(sx + 6, sy - 6, label)
+
+        # draw START point (large green marker)
+        if self._start_point:
+            lat, lon = self._start_point
+            px, py = self.latlon_to_pixels(lat, lon, self.zoom)
+            sx = int(px - tlx); sy = int(py - tly)
+
+            p.setRenderHint(QPainter.Antialiasing, True)
+            # Green circle with white border
+            p.setBrush(QtGui.QColor(0, 200, 0))
+            p.setPen(QPen(Qt.white, 3))
+            p.drawEllipse(QtCore.QPoint(sx, sy), 12, 12)
+            p.setPen(QPen(Qt.black, 2))
+            p.drawEllipse(QtCore.QPoint(sx, sy), 12, 12)
+            # "START" label
+            font = QFont("Arial", 9, QFont.Bold); p.setFont(font)
+            p.setPen(QPen(Qt.black, 3))
+            p.drawText(sx - 18, sy + 25, "START")
+            p.setPen(QtGui.QColor(0, 180, 0))
+            p.drawText(sx - 18, sy + 25, "START")
+            # Arrow/play icon inside
+            p.setPen(Qt.white)
+            p.setBrush(Qt.white)
+            triangle = QtGui.QPolygon([
+                QtCore.QPoint(sx - 4, sy - 6),
+                QtCore.QPoint(sx - 4, sy + 6),
+                QtCore.QPoint(sx + 6, sy)
+            ])
+            p.drawPolygon(triangle)
+
+        # draw END point (large red marker)
+        if self._end_point:
+            lat, lon = self._end_point
+            px, py = self.latlon_to_pixels(lat, lon, self.zoom)
+            ex = int(px - tlx); ey = int(py - tly)
+
+            p.setRenderHint(QPainter.Antialiasing, True)
+            # Red circle with white border
+            p.setBrush(QtGui.QColor(220, 50, 50))
+            p.setPen(QPen(Qt.white, 3))
+            p.drawEllipse(QtCore.QPoint(ex, ey), 12, 12)
+            p.setPen(QPen(Qt.black, 2))
+            p.drawEllipse(QtCore.QPoint(ex, ey), 12, 12)
+            # "END" label
+            font = QFont("Arial", 9, QFont.Bold); p.setFont(font)
+            p.setPen(QPen(Qt.black, 3))
+            p.drawText(ex - 10, ey + 25, "END")
+            p.setPen(QtGui.QColor(200, 0, 0))
+            p.drawText(ex - 10, ey + 25, "END")
+            # Square/stop icon inside
+            p.setPen(Qt.white)
+            p.setBrush(Qt.white)
+            p.drawRect(ex - 5, ey - 5, 10, 10)
 
         # draw generated coverage path (GREEN LINES - drone flight path)
         if self._generated_path:
@@ -1914,15 +2335,15 @@ class MapDashboard(QWidget):
         self.btn_clear_vehicle.setToolTip("Remove all waypoints from flight controller")
         tb.addWidget(self.btn_clear_vehicle)
 
-        # ============ PATH PLANNING TOOLBAR ============
+        # ============ PATH PLANNING TOOLBAR 1 - ZONES ============
         path_tb = QToolBar(); v.addWidget(path_tb)
 
         # Path planning section header
-        path_label = QLabel(" PATH PLANNING: ")
+        path_label = QLabel(" ZONES: ")
         path_label.setStyleSheet("font-weight: bold; color: #006600;")
         path_tb.addWidget(path_label)
 
-        # Boundary drawing mode
+        # Boundary drawing mode (Yellow Zone)
         self.btn_boundary_mode = QCheckBox("Draw Boundary")
         self.btn_boundary_mode.setToolTip(
             "Enable to draw survey boundary (YELLOW ZONE) by clicking on map.\n"
@@ -1931,8 +2352,54 @@ class MapDashboard(QWidget):
         self.btn_boundary_mode.setStyleSheet("QCheckBox { color: #cc8800; font-weight: bold; }")
         path_tb.addWidget(self.btn_boundary_mode)
 
+        # Red zone drawing mode (No-Fly Zone)
+        self.btn_red_zone_mode = QCheckBox("Draw No-Fly Zone")
+        self.btn_red_zone_mode.setToolTip(
+            "Enable to draw NO-FLY areas (RED ZONES) by clicking on map.\n"
+            "The drone will avoid these areas during path planning.\n"
+            "Click at least 3 points, then click 'Finish Zone'."
+        )
+        self.btn_red_zone_mode.setStyleSheet("QCheckBox { color: #cc0000; font-weight: bold; }")
+        path_tb.addWidget(self.btn_red_zone_mode)
+
+        # Finish red zone button
+        self.btn_finish_red_zone = QPushButton("Finish Zone")
+        self.btn_finish_red_zone.setStyleSheet("QPushButton { background-color: #ffcccc; }")
+        self.btn_finish_red_zone.setToolTip("Complete the current red zone polygon")
+        path_tb.addWidget(self.btn_finish_red_zone)
+
+        # Clear red zones button
+        self.btn_clear_red_zones = QPushButton("Clear Red Zones")
+        self.btn_clear_red_zones.setStyleSheet("QPushButton { background-color: #ff9999; }")
+        self.btn_clear_red_zones.setToolTip("Remove all no-fly zones")
+        path_tb.addWidget(self.btn_clear_red_zones)
+
+        path_tb.addSeparator()
+
+        # Start/End point controls
+        path_tb.addWidget(QLabel(" START/END: "))
+
+        self.btn_set_start = QCheckBox("Set Start")
+        self.btn_set_start.setToolTip("Click on map to set where the drone should START the survey")
+        self.btn_set_start.setStyleSheet("QCheckBox { color: #008800; font-weight: bold; }")
+        path_tb.addWidget(self.btn_set_start)
+
+        self.btn_set_end = QCheckBox("Set End")
+        self.btn_set_end.setToolTip("Click on map to set where the drone should END the survey")
+        self.btn_set_end.setStyleSheet("QCheckBox { color: #880000; font-weight: bold; }")
+        path_tb.addWidget(self.btn_set_end)
+
+        self.btn_clear_start_end = QPushButton("Clear S/E")
+        self.btn_clear_start_end.setToolTip("Clear start and end points")
+        path_tb.addWidget(self.btn_clear_start_end)
+
+        # ============ PATH PLANNING TOOLBAR 2 - GENERATION ============
+        path_tb2 = QToolBar(); v.addWidget(path_tb2)
+
+        path_tb2.addWidget(QLabel(" GENERATE: "))
+
         # Row width input
-        path_tb.addWidget(QLabel(" Row Width:"))
+        path_tb2.addWidget(QLabel(" Row Width:"))
         self.spin_row_width = QSpinBox()
         self.spin_row_width.setRange(1, 100)
         self.spin_row_width.setValue(10)
@@ -1942,58 +2409,59 @@ class MapDashboard(QWidget):
             "Smaller values = more coverage but longer flight time.\n"
             "Typical values: 5-20m depending on camera/sensor."
         )
-        path_tb.addWidget(self.spin_row_width)
+        path_tb2.addWidget(self.spin_row_width)
 
         # Altitude input
-        path_tb.addWidget(QLabel(" Alt:"))
+        path_tb2.addWidget(QLabel(" Alt:"))
         self.spin_path_alt = QSpinBox()
         self.spin_path_alt.setRange(5, 500)
         self.spin_path_alt.setValue(30)
         self.spin_path_alt.setSuffix(" m")
         self.spin_path_alt.setToolTip("Flight altitude for generated path (in meters)")
-        path_tb.addWidget(self.spin_path_alt)
+        path_tb2.addWidget(self.spin_path_alt)
 
-        path_tb.addSeparator()
+        path_tb2.addSeparator()
 
         # Generate path button
         self.btn_generate_path = QPushButton("Generate Path")
-        self.btn_generate_path.setStyleSheet("QPushButton { background-color: #90EE90; font-weight: bold; }")
+        self.btn_generate_path.setStyleSheet("QPushButton { background-color: #90EE90; font-weight: bold; padding: 5px; }")
         self.btn_generate_path.setToolTip(
             "Generate coverage flight path (GREEN LINES) inside the boundary.\n"
             "Creates a lawnmower pattern to survey the entire area.\n"
+            "Avoids red zones and respects start/end points.\n"
             "Requires at least 3 boundary points."
         )
-        path_tb.addWidget(self.btn_generate_path)
+        path_tb2.addWidget(self.btn_generate_path)
 
         # Apply path button
         self.btn_apply_path = QPushButton("Apply to Mission")
-        self.btn_apply_path.setStyleSheet("QPushButton { background-color: #87CEEB; font-weight: bold; }")
+        self.btn_apply_path.setStyleSheet("QPushButton { background-color: #87CEEB; font-weight: bold; padding: 5px; }")
         self.btn_apply_path.setToolTip(
             "Convert generated path to mission waypoints.\n"
             "This will replace current waypoints with the generated path."
         )
-        path_tb.addWidget(self.btn_apply_path)
+        path_tb2.addWidget(self.btn_apply_path)
 
         # Clear boundary button
-        self.btn_clear_boundary = QPushButton("Clear Boundary")
+        self.btn_clear_boundary = QPushButton("Clear All")
         self.btn_clear_boundary.setStyleSheet("QPushButton { background-color: #FFB6C1; }")
-        self.btn_clear_boundary.setToolTip("Clear the boundary polygon and generated path")
-        path_tb.addWidget(self.btn_clear_boundary)
+        self.btn_clear_boundary.setToolTip("Clear boundary, red zones, start/end points, and generated path")
+        path_tb2.addWidget(self.btn_clear_boundary)
 
         # Help button
         self.btn_path_help = QPushButton("?")
         self.btn_path_help.setFixedWidth(30)
         self.btn_path_help.setToolTip("Show path planning help")
-        path_tb.addWidget(self.btn_path_help)
+        path_tb2.addWidget(self.btn_path_help)
 
         # ============ STATUS/INFO LABEL ============
-        self.path_status_label = QLabel("Path Planning: Draw boundary (yellow) → Generate path (green) → Apply to mission")
+        self.path_status_label = QLabel("Path Planning: Draw boundary (yellow) → Add no-fly zones (red) → Set start/end → Generate path (green)")
         self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #f5f5dc; border: 1px solid #ddd; }")
         v.addWidget(self.path_status_label)
 
         # ============ MAP ============
-        map_label = QLabel("Map Legend: YELLOW = Survey Boundary | GREEN = Generated Path | CYAN = Mission Waypoints")
-        map_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background: #e8f4f8; }")
+        map_label = QLabel("YELLOW = Survey Boundary | RED = No-Fly Zone | GREEN = Flight Path | CYAN = Waypoints | START/END = Path endpoints")
+        map_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background: #e8f4f8; font-size: 10px; }")
         v.addWidget(map_label)
         self.plan_map.setFixedHeight(350)
         v.addWidget(self.plan_map)
@@ -2015,15 +2483,27 @@ class MapDashboard(QWidget):
         self.btn_clear_local.clicked.connect(self._clear_local)
         self.btn_clear_vehicle.clicked.connect(self._clear_vehicle)
 
-        # Path planning controls
+        # Path planning controls - Zones
         self.btn_boundary_mode.stateChanged.connect(self._on_boundary_mode_changed)
+        self.btn_red_zone_mode.stateChanged.connect(self._on_red_zone_mode_changed)
+        self.btn_finish_red_zone.clicked.connect(self._finish_red_zone)
+        self.btn_clear_red_zones.clicked.connect(self._clear_red_zones)
+
+        # Path planning controls - Start/End
+        self.btn_set_start.stateChanged.connect(self._on_start_mode_changed)
+        self.btn_set_end.stateChanged.connect(self._on_end_mode_changed)
+        self.btn_clear_start_end.clicked.connect(self._clear_start_end)
+
+        # Path planning controls - Generation
         self.btn_generate_path.clicked.connect(self._generate_coverage_path)
         self.btn_apply_path.clicked.connect(self._apply_path_to_mission)
-        self.btn_clear_boundary.clicked.connect(self._clear_boundary)
+        self.btn_clear_boundary.clicked.connect(self._clear_all_path_planning)
         self.btn_path_help.clicked.connect(self._show_path_help)
 
-        # Boundary sync between maps
+        # Sync between maps
         self.plan_map.boundaryChanged.connect(self._on_boundary_changed)
+        self.plan_map.redZonesChanged.connect(self._on_red_zones_changed)
+        self.plan_map.startEndChanged.connect(self._on_start_end_changed)
 
         return w
 
@@ -2047,6 +2527,7 @@ class MapDashboard(QWidget):
             self.btn_add_mode.setChecked(False)
 
         if enabled:
+            self._uncheck_other_modes('boundary')
             self.path_status_label.setText("BOUNDARY MODE: Click on map to add boundary points (need at least 3)")
             self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #fff3cd; border: 1px solid #ffc107; }")
             print("[UI] Boundary drawing mode ENABLED")
@@ -2054,6 +2535,190 @@ class MapDashboard(QWidget):
         else:
             self._update_path_status()
             print("[UI] Boundary drawing mode DISABLED")
+
+    def _on_red_zone_mode_changed(self):
+        """Handle red zone drawing mode toggle"""
+        enabled = self.btn_red_zone_mode.isChecked()
+        self.plan_map.set_red_zone_mode(enabled)
+        self.map.set_red_zone_mode(enabled)
+
+        if enabled:
+            self._uncheck_other_modes('red_zone')
+            self.path_status_label.setText("RED ZONE MODE: Click on map to add no-fly area points. Click 'Finish Zone' when done.")
+            self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #ffcccc; border: 1px solid #cc0000; }")
+            print("[UI] Red zone drawing mode ENABLED")
+            print("[UI] Instructions: Click on map to add no-fly area points. Need at least 3 points.")
+        else:
+            self._update_path_status()
+            print("[UI] Red zone drawing mode DISABLED")
+
+    def _on_start_mode_changed(self):
+        """Handle start point setting mode toggle"""
+        enabled = self.btn_set_start.isChecked()
+        self.plan_map.set_start_point_mode(enabled)
+        self.map.set_start_point_mode(enabled)
+
+        if enabled:
+            self._uncheck_other_modes('start')
+            self.path_status_label.setText("START POINT MODE: Click on map to set where the drone will START the survey")
+            self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #d4edda; border: 1px solid #28a745; }")
+            print("[UI] Start point setting mode ENABLED")
+        else:
+            self._update_path_status()
+            print("[UI] Start point setting mode DISABLED")
+
+    def _on_end_mode_changed(self):
+        """Handle end point setting mode toggle"""
+        enabled = self.btn_set_end.isChecked()
+        self.plan_map.set_end_point_mode(enabled)
+        self.map.set_end_point_mode(enabled)
+
+        if enabled:
+            self._uncheck_other_modes('end')
+            self.path_status_label.setText("END POINT MODE: Click on map to set where the drone will END the survey")
+            self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #f8d7da; border: 1px solid #dc3545; }")
+            print("[UI] End point setting mode ENABLED")
+        else:
+            self._update_path_status()
+            print("[UI] End point setting mode DISABLED")
+
+    def _uncheck_other_modes(self, keep_mode: str):
+        """Uncheck all mode checkboxes except the specified one"""
+        if keep_mode != 'add':
+            self.btn_add_mode.blockSignals(True)
+            self.btn_add_mode.setChecked(False)
+            self.btn_add_mode.blockSignals(False)
+        if keep_mode != 'boundary':
+            self.btn_boundary_mode.blockSignals(True)
+            self.btn_boundary_mode.setChecked(False)
+            self.btn_boundary_mode.blockSignals(False)
+        if keep_mode != 'red_zone':
+            self.btn_red_zone_mode.blockSignals(True)
+            self.btn_red_zone_mode.setChecked(False)
+            self.btn_red_zone_mode.blockSignals(False)
+        if keep_mode != 'start':
+            self.btn_set_start.blockSignals(True)
+            self.btn_set_start.setChecked(False)
+            self.btn_set_start.blockSignals(False)
+        if keep_mode != 'end':
+            self.btn_set_end.blockSignals(True)
+            self.btn_set_end.setChecked(False)
+            self.btn_set_end.blockSignals(False)
+
+    def _finish_red_zone(self):
+        """Finish drawing the current red zone"""
+        print("[UI] FINISH RED ZONE button clicked")
+        if self.plan_map.finish_current_red_zone():
+            self.path_status_label.setText(f"Red zone added! Total: {len(self.plan_map.get_red_zones())} no-fly zones")
+            self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #d4edda; border: 1px solid #28a745; }")
+            # Sync to other map
+            self.map.set_red_zones(self.plan_map.get_red_zones())
+            QMessageBox.information(self, "Red Zone Added",
+                f"No-fly zone added successfully!\n\n"
+                f"Total red zones: {len(self.plan_map.get_red_zones())}\n\n"
+                f"The path planner will avoid this area.")
+        else:
+            QMessageBox.warning(self, "Cannot Finish Zone",
+                "Need at least 3 points to create a red zone.\n\n"
+                "Keep clicking on the map to add more points.")
+
+    def _clear_red_zones(self):
+        """Clear all red zones"""
+        print("[UI] CLEAR RED ZONES button clicked")
+        count = len(self.plan_map.get_red_zones())
+        if count == 0:
+            QMessageBox.information(self, "Clear Red Zones", "No red zones to clear.")
+            return
+
+        reply = QMessageBox.question(self, "Clear Red Zones",
+            f"Remove all {count} red zone(s)?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            self.plan_map.clear_red_zones()
+            self.map.clear_red_zones()
+            self._update_path_status()
+            print(f"[UI] Cleared {count} red zones")
+
+    def _clear_start_end(self):
+        """Clear start and end points"""
+        print("[UI] CLEAR START/END button clicked")
+        self.plan_map.clear_start_end_points()
+        self.map.clear_start_end_points()
+        self._update_path_status()
+
+    def _on_red_zones_changed(self, red_zones):
+        """Handle red zones changes from map"""
+        self.map.set_red_zones(red_zones)
+        self.plan_map.set_red_zones(red_zones)
+        if red_zones:
+            self.path_status_label.setText(f"Red zones: {len(red_zones)} no-fly area(s) defined")
+
+    def _on_start_end_changed(self, start_point, end_point):
+        """Handle start/end point changes from map"""
+        # Sync to both maps
+        self.map.set_start_point(start_point)
+        self.map.set_end_point(end_point)
+        self.plan_map._start_point = start_point
+        self.plan_map._end_point = end_point
+
+        # Update status
+        parts = []
+        if start_point:
+            parts.append(f"START: ({start_point[0]:.5f}, {start_point[1]:.5f})")
+        if end_point:
+            parts.append(f"END: ({end_point[0]:.5f}, {end_point[1]:.5f})")
+        if parts:
+            self.path_status_label.setText(" | ".join(parts))
+            self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #d4edda; border: 1px solid #28a745; }")
+
+    def _clear_all_path_planning(self):
+        """Clear all path planning elements: boundary, red zones, start/end, generated path"""
+        print("[UI] CLEAR ALL button clicked")
+
+        has_data = (self.plan_map.get_boundary() or
+                   self.plan_map.get_red_zones() or
+                   self.plan_map.get_start_point() or
+                   self.plan_map.get_end_point() or
+                   hasattr(self, '_generated_path') and self._generated_path)
+
+        if not has_data:
+            QMessageBox.information(self, "Clear All", "Nothing to clear.")
+            return
+
+        reply = QMessageBox.question(self, "Clear All Path Planning",
+            "Clear all path planning elements?\n\n"
+            "This will remove:\n"
+            "- Survey boundary (yellow zone)\n"
+            "- All no-fly zones (red zones)\n"
+            "- Start and end points\n"
+            "- Generated path\n\n"
+            "This will NOT affect mission waypoints.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            # Clear boundary
+            self.plan_map.clear_boundary()
+            self.map.clear_boundary()
+
+            # Clear red zones
+            self.plan_map.clear_red_zones()
+            self.map.clear_red_zones()
+
+            # Clear start/end
+            self.plan_map.clear_start_end_points()
+            self.map.clear_start_end_points()
+
+            # Clear generated path
+            self.plan_map.clear_generated_path()
+            self.map.clear_generated_path()
+            if hasattr(self, '_generated_path'):
+                self._generated_path = []
+            if hasattr(self, '_path_stats'):
+                self._path_stats = {}
+
+            self._update_path_status()
+            print("[UI] All path planning elements cleared")
 
     def _on_boundary_changed(self, boundary):
         """Handle boundary polygon changes from map"""
@@ -2090,15 +2755,32 @@ class MapDashboard(QWidget):
         row_width = self.spin_row_width.value()
         altitude = self.spin_path_alt.value()
 
-        print(f"[UI] Generating coverage path...")
-        print(f"[UI] Parameters: Row width = {row_width}m, Altitude = {altitude}m")
-        print(f"[UI] Boundary has {len(boundary)} points")
+        # Get red zones (no-fly areas)
+        red_zones = self.plan_map.get_red_zones()
 
-        # Generate the path
+        # Get start and end points
+        start_point = self.plan_map.get_start_point()
+        end_point = self.plan_map.get_end_point()
+
+        print(f"[UI] Generating coverage path...")
+        print(f"[UI] Parameters:")
+        print(f"[UI]   - Row width: {row_width}m")
+        print(f"[UI]   - Altitude: {altitude}m")
+        print(f"[UI]   - Boundary points: {len(boundary)}")
+        print(f"[UI]   - Red zones (no-fly): {len(red_zones)}")
+        if start_point:
+            print(f"[UI]   - Start point: ({start_point[0]:.7f}, {start_point[1]:.7f})")
+        if end_point:
+            print(f"[UI]   - End point: ({end_point[0]:.7f}, {end_point[1]:.7f})")
+
+        # Generate the path with all parameters
         waypoints, stats = PathPlanner.generate_coverage_path(
             boundary=boundary,
             row_width_meters=row_width,
-            altitude=altitude
+            altitude=altitude,
+            red_zones=red_zones,
+            start_point=start_point,
+            end_point=end_point
         )
 
         if not waypoints:
@@ -2108,7 +2790,8 @@ class MapDashboard(QWidget):
                 "Try:\n"
                 "- Making the boundary larger\n"
                 "- Reducing the row width\n"
-                "- Checking that boundary points form a valid polygon")
+                "- Checking that boundary points form a valid polygon\n"
+                "- Ensuring red zones don't cover the entire area")
             return
 
         # Store generated path
@@ -2119,28 +2802,48 @@ class MapDashboard(QWidget):
         self.plan_map.set_generated_path(waypoints)
         self.map.set_generated_path(waypoints)
 
-        # Update status
+        # Update status with comprehensive info
         dist_km = stats['total_distance_m'] / 1000
         time_min = stats['estimated_time_s'] / 60
-        self.path_status_label.setText(
-            f"Path Generated: {stats['total_waypoints']} waypoints | "
-            f"{stats['total_lines']} lines | {dist_km:.2f} km | ~{time_min:.1f} min flight"
-        )
+        status_parts = [
+            f"{stats['total_waypoints']} waypoints",
+            f"{stats['total_lines']} lines",
+            f"{dist_km:.2f} km",
+            f"~{time_min:.1f} min"
+        ]
+        if stats.get('red_zones_count', 0) > 0:
+            status_parts.append(f"{stats['red_zones_count']} zones avoided")
+        if stats.get('has_start_point'):
+            status_parts.append("START set")
+        if stats.get('has_end_point'):
+            status_parts.append("END set")
+
+        self.path_status_label.setText("Path Generated: " + " | ".join(status_parts))
         self.path_status_label.setStyleSheet("QLabel { padding: 3px; background: #d4edda; border: 1px solid #28a745; font-weight: bold; }")
 
         print(f"\n[UI] Path generation successful!")
         print(f"[UI] Click 'Apply to Mission' to convert to mission waypoints")
 
-        QMessageBox.information(self, "Path Generated",
-            f"Coverage path generated successfully!\n\n"
-            f"Statistics:\n"
-            f"  - Waypoints: {stats['total_waypoints']}\n"
-            f"  - Survey lines: {stats['total_lines']}\n"
-            f"  - Total distance: {dist_km:.2f} km\n"
-            f"  - Estimated flight time: {time_min:.1f} minutes\n"
-            f"  - Row spacing: {stats['row_width_m']}m\n\n"
-            f"The GREEN path is now displayed on the map.\n"
-            f"Click 'Apply to Mission' to convert it to mission waypoints.")
+        # Build info message
+        msg_parts = [
+            f"Coverage path generated successfully!\n\n",
+            f"Statistics:\n",
+            f"  - Waypoints: {stats['total_waypoints']}\n",
+            f"  - Survey lines: {stats['total_lines']}\n",
+            f"  - Total distance: {dist_km:.2f} km\n",
+            f"  - Estimated flight time: {time_min:.1f} minutes\n",
+            f"  - Row spacing: {stats['row_width_m']}m\n",
+        ]
+        if stats.get('red_zones_count', 0) > 0:
+            msg_parts.append(f"  - Red zones avoided: {stats['red_zones_count']}\n")
+        if stats.get('has_start_point'):
+            msg_parts.append(f"  - Custom start point: YES\n")
+        if stats.get('has_end_point'):
+            msg_parts.append(f"  - Custom end point: YES\n")
+        msg_parts.append(f"\nThe GREEN path is now displayed on the map.\n")
+        msg_parts.append(f"Click 'Apply to Mission' to convert it to mission waypoints.")
+
+        QMessageBox.information(self, "Path Generated", "".join(msg_parts))
 
     def _apply_path_to_mission(self):
         """Apply generated path to mission waypoints"""
@@ -2243,16 +2946,34 @@ class MapDashboard(QWidget):
 
 <h3>Overview</h3>
 <p>This feature automatically generates a flight path to survey an area.
-The drone will fly in a <b>lawnmower pattern</b> (back and forth) to cover the entire region.</p>
+The drone will fly in a <b>lawnmower pattern</b> (back and forth) to cover the entire region,
+while avoiding no-fly zones and respecting custom start/end points.</p>
 
 <h3>Step-by-Step Instructions</h3>
 <ol>
-<li><b>Draw the Boundary (Yellow Zone)</b>
+<li><b>Draw the Survey Boundary (Yellow Zone)</b>
    <ul>
    <li>Enable "Draw Boundary" checkbox</li>
    <li>Click on the map to add boundary points</li>
    <li>Add at least 3 points to form a polygon</li>
    <li>The boundary will be shown in <span style="color: #cc8800;">YELLOW</span></li>
+   </ul>
+</li>
+<li><b>Add No-Fly Zones (Red Zones) - Optional</b>
+   <ul>
+   <li>Enable "Draw No-Fly Zone" checkbox</li>
+   <li>Click on the map to add red zone points</li>
+   <li>Add at least 3 points, then click "Finish Zone"</li>
+   <li>The drone will AVOID these <span style="color: red;">RED</span> areas</li>
+   <li>You can add multiple red zones</li>
+   </ul>
+</li>
+<li><b>Set Start/End Points - Optional</b>
+   <ul>
+   <li>Enable "Set Start" and click on map to set start position</li>
+   <li>Enable "Set End" and click on map to set end position</li>
+   <li>The path will begin at START and end at END</li>
+   <li>If not set, the planner will choose optimal points</li>
    </ul>
 </li>
 <li><b>Set Parameters</b>
@@ -2268,6 +2989,7 @@ The drone will fly in a <b>lawnmower pattern</b> (back and forth) to cover the e
    <li>Click "Generate Path" button</li>
    <li>The path will be shown in <span style="color: green;">GREEN</span></li>
    <li>Review the statistics (distance, time, waypoints)</li>
+   <li>Path will avoid all red zones automatically</li>
    </ul>
 </li>
 <li><b>Apply to Mission</b>
@@ -2287,16 +3009,21 @@ The drone will fly in a <b>lawnmower pattern</b> (back and forth) to cover the e
 <h3>Map Legend</h3>
 <ul>
 <li><span style="color: #cc8800;">■ YELLOW</span> = Survey boundary (area to cover)</li>
+<li><span style="color: red;">■ RED</span> = No-fly zones (drone will avoid)</li>
 <li><span style="color: green;">■ GREEN</span> = Generated coverage path</li>
 <li><span style="color: cyan;">■ CYAN</span> = Mission waypoints (uploaded to drone)</li>
+<li><b>START</b> = Path start point (green marker)</li>
+<li><b>END</b> = Path end point (red marker)</li>
 </ul>
 
 <h3>Tips</h3>
 <ul>
 <li>Larger row width = faster survey but less overlap</li>
 <li>For photogrammetry, use 60-80% overlap (smaller row width)</li>
-<li>The path starts at "S" (Start) and ends at "E" (End)</li>
-<li>You can clear the boundary and try different parameters</li>
+<li>Add red zones for obstacles, buildings, or restricted areas</li>
+<li>Set start point near takeoff location for efficiency</li>
+<li>Set end point near landing location</li>
+<li>Use "Clear All" to reset everything and start over</li>
 </ul>
 """
         msg = QMessageBox(self)
@@ -2682,30 +3409,37 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("   Ground Control Station (GCS) - Mission Planner")
-    print("   Version: UI9 - With Coverage Path Planning")
+    print("   Version: UI10 - Coverage Path Planning + No-Fly Zones")
     print("="*60)
     print("[System] Initializing application...")
 
     # Print path planning help on startup
     print("\n" + "-"*60)
-    print("   COVERAGE PATH PLANNING FEATURE")
+    print("   COVERAGE PATH PLANNING FEATURES")
     print("-"*60)
-    print("   This version includes automatic path generation for")
-    print("   survey/mapping missions.")
+    print("   This version includes automatic path generation with:")
+    print("   - Survey boundary (YELLOW zone)")
+    print("   - No-fly zones (RED zones) - drone avoids these areas")
+    print("   - Custom START and END points")
+    print("   - Configurable row width and altitude")
     print("")
     print("   HOW TO USE:")
     print("   1. Go to the 'Plan' tab")
-    print("   2. Enable 'Draw Boundary' checkbox")
-    print("   3. Click on map to draw survey area (YELLOW zone)")
-    print("   4. Set Row Width (meters between flight lines)")
-    print("   5. Click 'Generate Path' - creates GREEN path")
-    print("   6. Click 'Apply to Mission' to convert to waypoints")
-    print("   7. Click 'WRITE' to upload to drone")
+    print("   2. Draw survey boundary (YELLOW) - at least 3 points")
+    print("   3. [Optional] Draw no-fly zones (RED) - obstacles to avoid")
+    print("   4. [Optional] Set START and END points")
+    print("   5. Set Row Width (meters between flight lines)")
+    print("   6. Click 'Generate Path' - creates GREEN path")
+    print("   7. Click 'Apply to Mission' to convert to waypoints")
+    print("   8. Click 'WRITE' to upload to drone")
     print("")
     print("   MAP LEGEND:")
     print("   - YELLOW = Survey boundary (area to cover)")
+    print("   - RED    = No-fly zones (drone avoids these)")
     print("   - GREEN  = Generated flight path")
     print("   - CYAN   = Mission waypoints")
+    print("   - START  = Path starting point (green marker)")
+    print("   - END    = Path ending point (red marker)")
     print("-"*60 + "\n")
 
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
