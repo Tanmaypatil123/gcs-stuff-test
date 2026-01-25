@@ -110,6 +110,410 @@ class WP:
     p4: float = 0.0
     frame: int = 6  # MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
 
+# ---------------- Zone Types for DJI-like Path Planning ----------------
+from enum import Enum, auto
+
+class ZoneType(Enum):
+    RED = auto()      # Critical/No-fly zone - Drone cannot enter
+    YELLOW = auto()   # Warning zone - Boundary with alerts
+    GREEN = auto()    # Safe zone - Area where drone can travel/spray
+
+class PathStatus(Enum):
+    PENDING = auto()      # Path not yet traversed
+    IN_PROGRESS = auto()  # Currently being traversed
+    COMPLETED = auto()    # Path completed
+
+@dataclass
+class ZonePoint:
+    """A single point in a zone polygon"""
+    lat: float
+    lon: float
+
+@dataclass
+class Zone:
+    """Represents a geofence zone (Red/Yellow/Green)"""
+    zone_type: ZoneType
+    points: List[ZonePoint]  # Polygon vertices
+    name: str = ""
+
+    def contains_point(self, lat: float, lon: float) -> bool:
+        """Check if a point is inside this polygon using ray casting algorithm"""
+        if len(self.points) < 3:
+            return False
+
+        n = len(self.points)
+        inside = False
+        j = n - 1
+
+        for i in range(n):
+            xi, yi = self.points[i].lat, self.points[i].lon
+            xj, yj = self.points[j].lat, self.points[j].lon
+
+            if ((yi > lon) != (yj > lon)) and \
+               (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+
+        return inside
+
+@dataclass
+class SprayPath:
+    """A single spray path segment with status"""
+    start: ZonePoint
+    end: ZonePoint
+    status: PathStatus = PathStatus.PENDING
+    row_number: int = 0
+
+@dataclass
+class SprayingMission:
+    """Complete spraying mission configuration"""
+    boundary_zone: Optional[Zone] = None      # Yellow boundary
+    no_fly_zones: List[Zone] = None           # Red zones
+    spray_area: Optional[Zone] = None         # Green spray area
+    takeoff_point: Optional[ZonePoint] = None # GCS/Takeoff location
+
+    # Spray parameters
+    row_spacing: float = 3.0      # Meters between spray rows (based on boom width)
+    altitude: float = 3.0         # Spray altitude in meters
+    speed: float = 5.0            # Spray speed in m/s
+    swath_width: float = 3.0      # Spray swath width in meters
+
+    # Generated paths
+    spray_paths: List[SprayPath] = None
+    waypoints: List[WP] = None
+
+    # Progress tracking
+    current_path_index: int = 0
+
+    def __post_init__(self):
+        if self.no_fly_zones is None:
+            self.no_fly_zones = []
+        if self.spray_paths is None:
+            self.spray_paths = []
+        if self.waypoints is None:
+            self.waypoints = []
+
+
+class PathPlannerUtils:
+    """Utility functions for DJI-like path planning"""
+
+    # Earth radius in meters
+    EARTH_RADIUS = 6371000.0
+
+    @staticmethod
+    def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two GPS coordinates in meters"""
+        lat1_r = math.radians(lat1)
+        lat2_r = math.radians(lat2)
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+
+        a = math.sin(dlat/2)**2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+        return PathPlannerUtils.EARTH_RADIUS * c
+
+    @staticmethod
+    def bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate bearing from point 1 to point 2 in degrees"""
+        lat1_r = math.radians(lat1)
+        lat2_r = math.radians(lat2)
+        dlon = math.radians(lon2 - lon1)
+
+        x = math.sin(dlon) * math.cos(lat2_r)
+        y = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+
+        bearing = math.atan2(x, y)
+        return (math.degrees(bearing) + 360) % 360
+
+    @staticmethod
+    def destination_point(lat: float, lon: float, bearing_deg: float, distance_m: float) -> Tuple[float, float]:
+        """Calculate destination point given start, bearing and distance"""
+        lat_r = math.radians(lat)
+        lon_r = math.radians(lon)
+        bearing_r = math.radians(bearing_deg)
+
+        angular_dist = distance_m / PathPlannerUtils.EARTH_RADIUS
+
+        lat2 = math.asin(
+            math.sin(lat_r) * math.cos(angular_dist) +
+            math.cos(lat_r) * math.sin(angular_dist) * math.cos(bearing_r)
+        )
+
+        lon2 = lon_r + math.atan2(
+            math.sin(bearing_r) * math.sin(angular_dist) * math.cos(lat_r),
+            math.cos(angular_dist) - math.sin(lat_r) * math.sin(lat2)
+        )
+
+        return math.degrees(lat2), math.degrees(lon2)
+
+    @staticmethod
+    def polygon_centroid(points: List[ZonePoint]) -> Tuple[float, float]:
+        """Calculate centroid of a polygon"""
+        if not points:
+            return 0.0, 0.0
+
+        lat_sum = sum(p.lat for p in points)
+        lon_sum = sum(p.lon for p in points)
+        n = len(points)
+
+        return lat_sum / n, lon_sum / n
+
+    @staticmethod
+    def polygon_bounding_box(points: List[ZonePoint]) -> Tuple[float, float, float, float]:
+        """Get bounding box of polygon: (min_lat, min_lon, max_lat, max_lon)"""
+        if not points:
+            return 0, 0, 0, 0
+
+        lats = [p.lat for p in points]
+        lons = [p.lon for p in points]
+
+        return min(lats), min(lons), max(lats), max(lons)
+
+    @staticmethod
+    def line_polygon_intersection(p1: ZonePoint, p2: ZonePoint, polygon: List[ZonePoint]) -> List[ZonePoint]:
+        """Find intersection points of a line segment with polygon edges"""
+        intersections = []
+        n = len(polygon)
+
+        for i in range(n):
+            q1 = polygon[i]
+            q2 = polygon[(i + 1) % n]
+
+            intersection = PathPlannerUtils._line_segment_intersection(
+                p1.lat, p1.lon, p2.lat, p2.lon,
+                q1.lat, q1.lon, q2.lat, q2.lon
+            )
+
+            if intersection:
+                intersections.append(ZonePoint(intersection[0], intersection[1]))
+
+        return intersections
+
+    @staticmethod
+    def _line_segment_intersection(x1, y1, x2, y2, x3, y3, x4, y4) -> Optional[Tuple[float, float]]:
+        """Calculate intersection point of two line segments"""
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+
+        if abs(denom) < 1e-10:
+            return None
+
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+
+        if 0 <= t <= 1 and 0 <= u <= 1:
+            x = x1 + t * (x2 - x1)
+            y = y1 + t * (y2 - y1)
+            return (x, y)
+
+        return None
+
+
+class SprayPathGenerator:
+    """Generates DJI-like spray paths for autonomous spraying missions"""
+
+    def __init__(self, mission: SprayingMission):
+        self.mission = mission
+
+    def generate_parallel_paths(self, angle_deg: float = 0.0) -> List[SprayPath]:
+        """
+        Generate parallel spray paths within the spray area.
+
+        Args:
+            angle_deg: Angle of spray rows relative to North (0 = N-S, 90 = E-W)
+
+        Returns:
+            List of SprayPath objects
+        """
+        if not self.mission.spray_area or len(self.mission.spray_area.points) < 3:
+            return []
+
+        polygon = self.mission.spray_area.points
+        min_lat, min_lon, max_lat, max_lon = PathPlannerUtils.polygon_bounding_box(polygon)
+
+        # Calculate the diagonal distance to ensure coverage
+        diagonal = PathPlannerUtils.haversine_distance(min_lat, min_lon, max_lat, max_lon)
+
+        # Get centroid as reference point
+        center_lat, center_lon = PathPlannerUtils.polygon_centroid(polygon)
+
+        # Calculate number of rows needed
+        row_spacing_deg = self.mission.row_spacing / 111000.0  # Approximate meters to degrees
+
+        paths = []
+        row_number = 0
+
+        # Generate rows perpendicular to the spray direction
+        perpendicular_angle = (angle_deg + 90) % 360
+
+        # Calculate offset range based on polygon size
+        width = PathPlannerUtils.haversine_distance(min_lat, min_lon, min_lat, max_lon)
+        height = PathPlannerUtils.haversine_distance(min_lat, min_lon, max_lat, min_lon)
+        max_offset = max(width, height) / 2 + 50  # Add buffer
+
+        # Generate rows from one side to the other
+        offset = -max_offset
+        while offset <= max_offset:
+            # Calculate row start point (offset from center perpendicular to spray direction)
+            row_center_lat, row_center_lon = PathPlannerUtils.destination_point(
+                center_lat, center_lon, perpendicular_angle, offset
+            )
+
+            # Create a long line through this point in the spray direction
+            line_start_lat, line_start_lon = PathPlannerUtils.destination_point(
+                row_center_lat, row_center_lon, angle_deg, -diagonal
+            )
+            line_end_lat, line_end_lon = PathPlannerUtils.destination_point(
+                row_center_lat, row_center_lon, angle_deg, diagonal
+            )
+
+            # Find intersections with polygon boundary
+            intersections = PathPlannerUtils.line_polygon_intersection(
+                ZonePoint(line_start_lat, line_start_lon),
+                ZonePoint(line_end_lat, line_end_lon),
+                polygon
+            )
+
+            # If we have at least 2 intersection points, create a path
+            if len(intersections) >= 2:
+                # Sort intersections along the spray direction
+                intersections.sort(key=lambda p: (
+                    PathPlannerUtils.haversine_distance(line_start_lat, line_start_lon, p.lat, p.lon)
+                ))
+
+                # Create path from first to second intersection (within polygon)
+                start = intersections[0]
+                end = intersections[1]
+
+                # Check if path should be reversed (alternate pattern)
+                if row_number % 2 == 1:
+                    start, end = end, start
+
+                # Verify path doesn't cross any no-fly zones
+                if not self._path_crosses_no_fly_zone(start, end):
+                    path = SprayPath(
+                        start=start,
+                        end=end,
+                        status=PathStatus.PENDING,
+                        row_number=row_number
+                    )
+                    paths.append(path)
+                    row_number += 1
+
+            offset += self.mission.row_spacing
+
+        self.mission.spray_paths = paths
+        return paths
+
+    def _path_crosses_no_fly_zone(self, start: ZonePoint, end: ZonePoint) -> bool:
+        """Check if a path segment crosses any no-fly zone"""
+        for zone in self.mission.no_fly_zones:
+            if zone.zone_type == ZoneType.RED:
+                # Check if any point on the path is inside the zone
+                if zone.contains_point(start.lat, start.lon):
+                    return True
+                if zone.contains_point(end.lat, end.lon):
+                    return True
+
+                # Check for intersections with zone boundary
+                intersections = PathPlannerUtils.line_polygon_intersection(start, end, zone.points)
+                if intersections:
+                    return True
+
+        return False
+
+    def generate_waypoints(self) -> List[WP]:
+        """Convert spray paths to MAVLink waypoints"""
+        waypoints = []
+
+        # Add takeoff waypoint
+        if self.mission.takeoff_point:
+            takeoff_wp = WP(
+                cmd=CMD_TAKEOFF,
+                lat=self.mission.takeoff_point.lat,
+                lon=self.mission.takeoff_point.lon,
+                alt=self.mission.altitude
+            )
+            waypoints.append(takeoff_wp)
+
+        # Add waypoints for each spray path
+        for path in self.mission.spray_paths:
+            # Start of spray row
+            wp_start = WP(
+                cmd=CMD_WAYPOINT,
+                lat=path.start.lat,
+                lon=path.start.lon,
+                alt=self.mission.altitude,
+                p1=0,  # Hold time
+                p2=self.mission.speed  # Speed
+            )
+            waypoints.append(wp_start)
+
+            # End of spray row
+            wp_end = WP(
+                cmd=CMD_WAYPOINT,
+                lat=path.end.lat,
+                lon=path.end.lon,
+                alt=self.mission.altitude,
+                p1=0,
+                p2=self.mission.speed
+            )
+            waypoints.append(wp_end)
+
+        # Add RTL at the end
+        if waypoints:
+            rtl_wp = WP(
+                cmd=CMD_RTL,
+                lat=waypoints[0].lat if waypoints else 0,
+                lon=waypoints[0].lon if waypoints else 0,
+                alt=self.mission.altitude
+            )
+            waypoints.append(rtl_wp)
+
+        self.mission.waypoints = waypoints
+        return waypoints
+
+    def calculate_mission_stats(self) -> Dict[str, Any]:
+        """Calculate mission statistics"""
+        total_distance = 0.0
+        spray_distance = 0.0
+
+        # Calculate spray path distances
+        for path in self.mission.spray_paths:
+            dist = PathPlannerUtils.haversine_distance(
+                path.start.lat, path.start.lon,
+                path.end.lat, path.end.lon
+            )
+            spray_distance += dist
+
+        # Calculate total distance including turns
+        if len(self.mission.waypoints) >= 2:
+            for i in range(len(self.mission.waypoints) - 1):
+                wp1 = self.mission.waypoints[i]
+                wp2 = self.mission.waypoints[i + 1]
+                total_distance += PathPlannerUtils.haversine_distance(
+                    wp1.lat, wp1.lon, wp2.lat, wp2.lon
+                )
+
+        # Estimate area coverage
+        area_m2 = spray_distance * self.mission.swath_width
+        area_acres = area_m2 / 4046.86  # Convert to acres
+
+        # Estimate time
+        estimated_time_sec = total_distance / self.mission.speed if self.mission.speed > 0 else 0
+
+        return {
+            "total_distance_m": total_distance,
+            "spray_distance_m": spray_distance,
+            "area_m2": area_m2,
+            "area_acres": area_acres,
+            "num_rows": len(self.mission.spray_paths),
+            "num_waypoints": len(self.mission.waypoints),
+            "estimated_time_sec": estimated_time_sec,
+            "estimated_time_min": estimated_time_sec / 60
+        }
+
+
 # ---------------- MAVLink worker ----------------
 class MavWorker(QThread):
     log = pyqtSignal(str)
@@ -1193,6 +1597,15 @@ class HUDPanel(QWidget):
 class MapWidget(QWidget):
     userInteracted = pyqtSignal(int)
     waypointsChanged = pyqtSignal(list)  # emits List[WP] whenever WPs change on this map
+    zonePointAdded = pyqtSignal(float, float)  # emits (lat, lon) when zone point is added
+    zonesChanged = pyqtSignal()  # emits when zones are modified
+
+    # Drawing mode constants
+    MODE_NORMAL = 0
+    MODE_ADD_WAYPOINT = 1
+    MODE_DRAW_RED_ZONE = 2
+    MODE_DRAW_YELLOW_ZONE = 3
+    MODE_DRAW_GREEN_ZONE = 4
 
     def __init__(self, status_provider=lambda: None, show_overlays: bool = True):
         super().__init__()
@@ -1210,6 +1623,15 @@ class MapWidget(QWidget):
 
         self._wps: List[WP] = []
         self.add_mode = False
+
+        # Zone and spray path management
+        self._zones: List[Zone] = []  # All defined zones
+        self._spray_paths: List[SprayPath] = []  # Generated spray paths
+        self._current_zone_points: List[ZonePoint] = []  # Points being drawn
+        self._drawing_mode = self.MODE_NORMAL
+        self._takeoff_point: Optional[ZonePoint] = None  # GCS/Takeoff location
+        self._drone_position: Optional[Tuple[float, float]] = None  # Current drone GPS
+        self._current_path_index: int = -1  # Currently active path (-1 = none)
 
         # overlays optional on plan map
         self.hud = HUDPanel() if show_overlays else None
@@ -1241,12 +1663,132 @@ class MapWidget(QWidget):
 
     def set_add_mode(self, enabled: bool): self.add_mode = enabled
 
+    def set_drawing_mode(self, mode: int):
+        """Set the current drawing mode (NORMAL, ADD_WAYPOINT, DRAW_*_ZONE)"""
+        self._drawing_mode = mode
+        self.add_mode = (mode == self.MODE_ADD_WAYPOINT)
+        if mode == self.MODE_NORMAL:
+            self._current_zone_points = []
+        self.update()
+
+    def get_drawing_mode(self) -> int:
+        return self._drawing_mode
+
     def set_waypoints(self, wps: List[WP]):
         self._wps = wps[:]
         self.update()
 
     def get_waypoints(self) -> List[WP]:
         return self._wps[:]
+
+    # Zone management methods
+    def set_zones(self, zones: List[Zone]):
+        """Set all zones"""
+        self._zones = zones[:]
+        self.update()
+
+    def get_zones(self) -> List[Zone]:
+        """Get all zones"""
+        return self._zones[:]
+
+    def add_zone(self, zone: Zone):
+        """Add a zone"""
+        self._zones.append(zone)
+        self.zonesChanged.emit()
+        self.update()
+
+    def remove_zone(self, index: int):
+        """Remove a zone by index"""
+        if 0 <= index < len(self._zones):
+            del self._zones[index]
+            self.zonesChanged.emit()
+            self.update()
+
+    def clear_zones(self):
+        """Clear all zones"""
+        self._zones = []
+        self.zonesChanged.emit()
+        self.update()
+
+    def get_zones_by_type(self, zone_type: ZoneType) -> List[Zone]:
+        """Get zones of a specific type"""
+        return [z for z in self._zones if z.zone_type == zone_type]
+
+    def finish_current_zone(self) -> Optional[Zone]:
+        """Finish drawing current zone and return it"""
+        if len(self._current_zone_points) >= 3:
+            zone_type = {
+                self.MODE_DRAW_RED_ZONE: ZoneType.RED,
+                self.MODE_DRAW_YELLOW_ZONE: ZoneType.YELLOW,
+                self.MODE_DRAW_GREEN_ZONE: ZoneType.GREEN
+            }.get(self._drawing_mode, ZoneType.GREEN)
+
+            zone = Zone(
+                zone_type=zone_type,
+                points=self._current_zone_points[:],
+                name=f"{zone_type.name} Zone {len(self._zones) + 1}"
+            )
+            self._zones.append(zone)
+            self._current_zone_points = []
+            self.zonesChanged.emit()
+            self.update()
+            return zone
+        return None
+
+    def cancel_current_zone(self):
+        """Cancel current zone drawing"""
+        self._current_zone_points = []
+        self.update()
+
+    # Spray path management
+    def set_spray_paths(self, paths: List[SprayPath]):
+        """Set spray paths for visualization"""
+        self._spray_paths = paths[:]
+        self.update()
+
+    def get_spray_paths(self) -> List[SprayPath]:
+        return self._spray_paths[:]
+
+    def clear_spray_paths(self):
+        """Clear all spray paths"""
+        self._spray_paths = []
+        self.update()
+
+    def set_current_path_index(self, index: int):
+        """Set the currently active path index (for progress tracking)"""
+        self._current_path_index = index
+        # Update path statuses
+        for i, path in enumerate(self._spray_paths):
+            if i < index:
+                path.status = PathStatus.COMPLETED
+            elif i == index:
+                path.status = PathStatus.IN_PROGRESS
+            else:
+                path.status = PathStatus.PENDING
+        self.update()
+
+    # Takeoff point management
+    def set_takeoff_point(self, lat: float, lon: float):
+        """Set the takeoff/GCS location"""
+        self._takeoff_point = ZonePoint(lat, lon)
+        self.update()
+
+    def get_takeoff_point(self) -> Optional[ZonePoint]:
+        return self._takeoff_point
+
+    def clear_takeoff_point(self):
+        self._takeoff_point = None
+        self.update()
+
+    # Drone position for real-time tracking
+    def set_drone_position(self, lat: float, lon: float):
+        """Update drone's current GPS position"""
+        self._drone_position = (lat, lon)
+        self.update()
+
+    def clear_drone_position(self):
+        self._drone_position = None
+        self.update()
 
     # conversions
     def latlon_to_pixels(self, lat, lon, z):
@@ -1285,13 +1827,30 @@ class MapWidget(QWidget):
 
     def mousePressEvent(self, e: QtGui.QMouseEvent):
         if e.button() == Qt.LeftButton:
-            if self.add_mode:
+            # Convert click position to lat/lon
+            w, h = self.width(), self.height()
+            cx, cy = self.latlon_to_pixels(self.center_lat, self.center_lon, self.zoom)
+            tlx, tly = cx - w/2, cy - h/2
+            px, py = tlx + e.pos().x(), tly + e.pos().y()
+            lat, lon = self.pixels_to_latlon(px, py, self.zoom)
+
+            # Handle different drawing modes
+            if self._drawing_mode in [self.MODE_DRAW_RED_ZONE, self.MODE_DRAW_YELLOW_ZONE, self.MODE_DRAW_GREEN_ZONE]:
+                # Zone drawing mode - add point to current zone
+                self._current_zone_points.append(ZonePoint(lat, lon))
+                zone_type_name = {
+                    self.MODE_DRAW_RED_ZONE: "RED",
+                    self.MODE_DRAW_YELLOW_ZONE: "YELLOW",
+                    self.MODE_DRAW_GREEN_ZONE: "GREEN"
+                }.get(self._drawing_mode, "UNKNOWN")
+                print(f"[Map] Added {zone_type_name} zone point {len(self._current_zone_points)}: Lat={lat:.7f}, Lon={lon:.7f}")
+                self.zonePointAdded.emit(lat, lon)
+                self.update()
+                self.userInteracted.emit(3500)
+                e.accept(); return
+
+            elif self.add_mode or self._drawing_mode == self.MODE_ADD_WAYPOINT:
                 # Add a waypoint at click
-                w,h=self.width(),self.height()
-                cx,cy=self.latlon_to_pixels(self.center_lat,self.center_lon,self.zoom)
-                tlx,tly=cx-w/2,cy-h/2
-                px,py=tlx+e.pos().x(),tly+e.pos().y()
-                lat,lon=self.pixels_to_latlon(px,py,self.zoom)
                 default_alt = 30.0 if not self._wps else self._wps[-1].alt
                 cmd = CMD_WAYPOINT if self._wps else CMD_TAKEOFF
                 wp_num = len(self._wps)
@@ -1301,8 +1860,18 @@ class MapWidget(QWidget):
                 self.waypointsChanged.emit(self.get_waypoints())
                 self.userInteracted.emit(3500)
                 e.accept(); return
+
+            # Normal mode - start drag
             self._drag = True; self._last = e.pos()
             self.userInteracted.emit(3500); e.accept()
+        elif e.button() == Qt.RightButton:
+            # Right-click to finish zone drawing
+            if self._drawing_mode in [self.MODE_DRAW_RED_ZONE, self.MODE_DRAW_YELLOW_ZONE, self.MODE_DRAW_GREEN_ZONE]:
+                zone = self.finish_current_zone()
+                if zone:
+                    print(f"[Map] Finished {zone.zone_type.name} zone with {len(zone.points)} points")
+                e.accept(); return
+            e.ignore()
         else:
             e.ignore()
 
@@ -1358,17 +1927,165 @@ class MapWidget(QWidget):
                 else:
                     p.drawPixmap(sx,sy,pm)
 
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # === Draw Zones (DJI-like visualization) ===
+        # Draw order: GREEN (bottom) -> YELLOW (middle) -> RED (top)
+        zone_colors = {
+            ZoneType.GREEN: (QtGui.QColor(0, 255, 0, 60), QtGui.QColor(0, 200, 0), 2),    # Fill, Border, Width
+            ZoneType.YELLOW: (QtGui.QColor(255, 165, 0, 80), QtGui.QColor(255, 140, 0), 3),
+            ZoneType.RED: (QtGui.QColor(255, 0, 0, 100), QtGui.QColor(200, 0, 0), 4),
+        }
+
+        # Draw zones in order: GREEN, YELLOW, RED
+        for zone_type in [ZoneType.GREEN, ZoneType.YELLOW, ZoneType.RED]:
+            for zone in self._zones:
+                if zone.zone_type != zone_type or len(zone.points) < 3:
+                    continue
+
+                # Convert zone points to screen coordinates
+                poly_points = []
+                for pt in zone.points:
+                    px, py = self.latlon_to_pixels(pt.lat, pt.lon, self.zoom)
+                    sx, sy = int(px - tlx), int(py - tly)
+                    poly_points.append(QtCore.QPoint(sx, sy))
+
+                polygon = QtGui.QPolygon(poly_points)
+                fill_color, border_color, border_width = zone_colors[zone_type]
+
+                # Fill polygon
+                p.setBrush(fill_color)
+                p.setPen(QPen(border_color, border_width))
+                p.drawPolygon(polygon)
+
+                # Add zone label at centroid
+                if poly_points:
+                    center_x = sum(pt.x() for pt in poly_points) // len(poly_points)
+                    center_y = sum(pt.y() for pt in poly_points) // len(poly_points)
+                    font = QFont("Arial", 9, QFont.Bold)
+                    p.setFont(font)
+                    p.setPen(QPen(Qt.white, 2))
+                    label = zone_type.name
+                    p.drawText(center_x - 20, center_y, label)
+                    p.setPen(border_color)
+                    p.drawText(center_x - 20, center_y, label)
+
+        # === Draw currently-being-drawn zone ===
+        if self._current_zone_points:
+            current_color = {
+                self.MODE_DRAW_RED_ZONE: QtGui.QColor(255, 0, 0),
+                self.MODE_DRAW_YELLOW_ZONE: QtGui.QColor(255, 165, 0),
+                self.MODE_DRAW_GREEN_ZONE: QtGui.QColor(0, 255, 0),
+            }.get(self._drawing_mode, QtGui.QColor(255, 255, 255))
+
+            poly_points = []
+            for pt in self._current_zone_points:
+                px, py = self.latlon_to_pixels(pt.lat, pt.lon, self.zoom)
+                sx, sy = int(px - tlx), int(py - tly)
+                poly_points.append((sx, sy))
+
+            # Draw lines between points
+            p.setPen(QPen(current_color, 2, Qt.DashLine))
+            for i in range(len(poly_points) - 1):
+                p.drawLine(poly_points[i][0], poly_points[i][1],
+                          poly_points[i+1][0], poly_points[i+1][1])
+
+            # Draw closing line (dashed)
+            if len(poly_points) >= 3:
+                p.setPen(QPen(current_color, 1, Qt.DotLine))
+                p.drawLine(poly_points[-1][0], poly_points[-1][1],
+                          poly_points[0][0], poly_points[0][1])
+
+            # Draw points
+            p.setBrush(current_color)
+            p.setPen(QPen(Qt.white, 2))
+            for i, (sx, sy) in enumerate(poly_points):
+                p.drawEllipse(QtCore.QPoint(sx, sy), 6, 6)
+                # Draw point number
+                font = QFont("Arial", 8, QFont.Bold)
+                p.setFont(font)
+                p.setPen(Qt.white)
+                p.drawText(sx + 8, sy - 8, str(i + 1))
+
+        # === Draw Spray Paths with status colors ===
+        if self._spray_paths:
+            for path in self._spray_paths:
+                # Color based on path status
+                if path.status == PathStatus.COMPLETED:
+                    path_color = QtGui.QColor(0, 200, 0)  # Green - completed
+                    line_width = 2
+                elif path.status == PathStatus.IN_PROGRESS:
+                    path_color = QtGui.QColor(0, 255, 255)  # Cyan - in progress
+                    line_width = 3
+                else:  # PENDING
+                    path_color = QtGui.QColor(255, 255, 255)  # White - pending
+                    line_width = 2
+
+                # Convert path endpoints to screen coordinates
+                start_px, start_py = self.latlon_to_pixels(path.start.lat, path.start.lon, self.zoom)
+                end_px, end_py = self.latlon_to_pixels(path.end.lat, path.end.lon, self.zoom)
+                start_sx, start_sy = int(start_px - tlx), int(start_py - tly)
+                end_sx, end_sy = int(end_px - tlx), int(end_py - tly)
+
+                # Draw path line
+                p.setPen(QPen(path_color, line_width))
+                p.drawLine(start_sx, start_sy, end_sx, end_sy)
+
+                # Draw row number at start of path
+                if path.row_number % 2 == 0:  # Only show every other row number
+                    font = QFont("Arial", 7)
+                    p.setFont(font)
+                    p.setPen(path_color)
+                    p.drawText(start_sx + 3, start_sy - 3, str(path.row_number + 1))
+
+        # === Draw Takeoff Point (GCS Location) ===
+        if self._takeoff_point:
+            tp_px, tp_py = self.latlon_to_pixels(self._takeoff_point.lat, self._takeoff_point.lon, self.zoom)
+            tp_sx, tp_sy = int(tp_px - tlx), int(tp_py - tly)
+
+            # Draw takeoff symbol (circle with H)
+            p.setBrush(QtGui.QColor(0, 100, 255, 180))
+            p.setPen(QPen(Qt.white, 2))
+            p.drawEllipse(QtCore.QPoint(tp_sx, tp_sy), 12, 12)
+
+            # Draw "H" for home/takeoff
+            font = QFont("Arial", 10, QFont.Bold)
+            p.setFont(font)
+            p.setPen(Qt.white)
+            p.drawText(tp_sx - 5, tp_sy + 4, "H")
+
+            # Draw "TAKEOFF" label
+            font = QFont("Arial", 8)
+            p.setFont(font)
+            p.setPen(Qt.white)
+            p.drawText(tp_sx + 15, tp_sy + 4, "TAKEOFF")
+
+        # === Draw Drone Position (if available) ===
+        if self._drone_position:
+            drone_lat, drone_lon = self._drone_position
+            drone_px, drone_py = self.latlon_to_pixels(drone_lat, drone_lon, self.zoom)
+            drone_sx, drone_sy = int(drone_px - tlx), int(drone_py - tly)
+
+            # Draw drone symbol (triangle pointing up)
+            drone_icon = QtGui.QPolygon([
+                QtCore.QPoint(drone_sx, drone_sy - 10),
+                QtCore.QPoint(drone_sx - 7, drone_sy + 7),
+                QtCore.QPoint(drone_sx + 7, drone_sy + 7)
+            ])
+            p.setBrush(QtGui.QColor(0, 200, 255))
+            p.setPen(QPen(Qt.white, 2))
+            p.drawPolygon(drone_icon)
+
         # crosshair
         p.setPen(Qt.red); p.drawLine(w//2-10,h//2,w//2+10,h//2); p.drawLine(w//2,h//2-10,w//2,h//2+10)
 
-        # draw planned path/points (high contrast)
+        # draw planned path/points (high contrast) - waypoints
         if self._wps:
             pts=[]
             for wp in self._wps:
                 px,py=self.latlon_to_pixels(wp.lat,wp.lon,self.zoom)
                 sx=int(px-tlx); sy=int(py-tly)
                 pts.append((sx,sy))
-            p.setRenderHint(QPainter.Antialiasing, True)
             p.setPen(QPen(Qt.yellow, 3))
             for i in range(len(pts)-1):
                 p.drawLine(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1])
@@ -1386,7 +2103,16 @@ class MapWidget(QWidget):
                 p.setPen(Qt.white)
                 p.drawText(sx+10, sy-10, label)
 
-        p.setPen(Qt.black); p.drawText(10, self.height()-10, f"Lat {self.center_lat:.5f}  Lon {self.center_lon:.5f}  Zoom {self.zoom}")
+        # Status text at bottom
+        mode_text = {
+            self.MODE_NORMAL: "",
+            self.MODE_ADD_WAYPOINT: " [ADD WAYPOINT MODE]",
+            self.MODE_DRAW_RED_ZONE: " [DRAW RED ZONE - Click to add points, Right-click to finish]",
+            self.MODE_DRAW_YELLOW_ZONE: " [DRAW YELLOW ZONE - Click to add points, Right-click to finish]",
+            self.MODE_DRAW_GREEN_ZONE: " [DRAW GREEN ZONE - Click to add points, Right-click to finish]",
+        }.get(self._drawing_mode, "")
+
+        p.setPen(Qt.black); p.drawText(10, self.height()-10, f"Lat {self.center_lat:.5f}  Lon {self.center_lon:.5f}  Zoom {self.zoom}{mode_text}")
 
     def _status(self, s: str):
         sb = self._statusbar() if callable(self._statusbar) else None
@@ -1446,6 +2172,396 @@ class PlannerTable(QTableWidget):
     def clear_all(self):
         self.setRowCount(0)
 
+
+# ---------------- Spray Planner Panel (DJI-like Path Planning) ----------------
+class SprayPlannerPanel(QWidget):
+    """Panel for DJI-like autonomous spray path planning"""
+    missionGenerated = pyqtSignal(list)  # Emits List[WP] when mission is generated
+
+    def __init__(self, map_widget: MapWidget, worker: MavWorker):
+        super().__init__()
+        self.map_widget = map_widget
+        self.worker = worker
+        self.mission = SprayingMission()
+        self._gps_lat = None
+        self._gps_lon = None
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # === Zone Drawing Section ===
+        zone_group = QtWidgets.QGroupBox("Zone Definition (DJI-style)")
+        zone_layout = QVBoxLayout(zone_group)
+
+        zone_btn_layout = QHBoxLayout()
+        self.btn_draw_red = QPushButton("Draw RED Zone (No-Fly)")
+        self.btn_draw_red.setStyleSheet("background-color: #cc0000; color: white; font-weight: bold;")
+        self.btn_draw_red.setCheckable(True)
+        self.btn_draw_yellow = QPushButton("Draw YELLOW Zone (Boundary)")
+        self.btn_draw_yellow.setStyleSheet("background-color: #ff8c00; color: white; font-weight: bold;")
+        self.btn_draw_yellow.setCheckable(True)
+        self.btn_draw_green = QPushButton("Draw GREEN Zone (Spray Area)")
+        self.btn_draw_green.setStyleSheet("background-color: #008800; color: white; font-weight: bold;")
+        self.btn_draw_green.setCheckable(True)
+
+        zone_btn_layout.addWidget(self.btn_draw_red)
+        zone_btn_layout.addWidget(self.btn_draw_yellow)
+        zone_btn_layout.addWidget(self.btn_draw_green)
+        zone_layout.addLayout(zone_btn_layout)
+
+        zone_actions_layout = QHBoxLayout()
+        self.btn_finish_zone = QPushButton("Finish Zone (Right-click)")
+        self.btn_cancel_zone = QPushButton("Cancel Drawing")
+        self.btn_clear_zones = QPushButton("Clear All Zones")
+        zone_actions_layout.addWidget(self.btn_finish_zone)
+        zone_actions_layout.addWidget(self.btn_cancel_zone)
+        zone_actions_layout.addWidget(self.btn_clear_zones)
+        zone_layout.addLayout(zone_actions_layout)
+
+        # Zone info label
+        self.zone_info = QLabel("Zones: 0 RED | 0 YELLOW | 0 GREEN")
+        self.zone_info.setStyleSheet("font-weight: bold; padding: 5px;")
+        zone_layout.addWidget(self.zone_info)
+
+        layout.addWidget(zone_group)
+
+        # === Takeoff Point Section ===
+        takeoff_group = QtWidgets.QGroupBox("Takeoff Point (GCS Location)")
+        takeoff_layout = QHBoxLayout(takeoff_group)
+
+        self.btn_set_takeoff_gps = QPushButton("Set from GPS")
+        self.btn_set_takeoff_gps.setToolTip("Use current drone GPS position as takeoff point")
+        self.btn_set_takeoff_map = QPushButton("Set from Map Center")
+        self.btn_set_takeoff_map.setToolTip("Use map center as takeoff point")
+        self.btn_clear_takeoff = QPushButton("Clear")
+
+        self.takeoff_label = QLabel("Not Set")
+        self.takeoff_label.setStyleSheet("color: #666; font-style: italic;")
+
+        takeoff_layout.addWidget(self.btn_set_takeoff_gps)
+        takeoff_layout.addWidget(self.btn_set_takeoff_map)
+        takeoff_layout.addWidget(self.btn_clear_takeoff)
+        takeoff_layout.addWidget(self.takeoff_label, 1)
+
+        layout.addWidget(takeoff_group)
+
+        # === Spray Parameters Section ===
+        params_group = QtWidgets.QGroupBox("Spray Parameters")
+        params_layout = QGridLayout(params_group)
+
+        params_layout.addWidget(QLabel("Row Spacing (m):"), 0, 0)
+        self.spin_row_spacing = QtWidgets.QDoubleSpinBox()
+        self.spin_row_spacing.setRange(0.5, 20.0)
+        self.spin_row_spacing.setValue(3.0)
+        self.spin_row_spacing.setSingleStep(0.5)
+        params_layout.addWidget(self.spin_row_spacing, 0, 1)
+
+        params_layout.addWidget(QLabel("Spray Altitude (m):"), 0, 2)
+        self.spin_altitude = QtWidgets.QDoubleSpinBox()
+        self.spin_altitude.setRange(1.0, 50.0)
+        self.spin_altitude.setValue(3.0)
+        self.spin_altitude.setSingleStep(0.5)
+        params_layout.addWidget(self.spin_altitude, 0, 3)
+
+        params_layout.addWidget(QLabel("Flight Speed (m/s):"), 1, 0)
+        self.spin_speed = QtWidgets.QDoubleSpinBox()
+        self.spin_speed.setRange(0.5, 15.0)
+        self.spin_speed.setValue(5.0)
+        self.spin_speed.setSingleStep(0.5)
+        params_layout.addWidget(self.spin_speed, 1, 1)
+
+        params_layout.addWidget(QLabel("Swath Width (m):"), 1, 2)
+        self.spin_swath = QtWidgets.QDoubleSpinBox()
+        self.spin_swath.setRange(0.5, 20.0)
+        self.spin_swath.setValue(3.0)
+        self.spin_swath.setSingleStep(0.5)
+        params_layout.addWidget(self.spin_swath, 1, 3)
+
+        params_layout.addWidget(QLabel("Path Angle (deg):"), 2, 0)
+        self.spin_angle = QtWidgets.QDoubleSpinBox()
+        self.spin_angle.setRange(0, 359)
+        self.spin_angle.setValue(0)
+        self.spin_angle.setSingleStep(15)
+        self.spin_angle.setToolTip("0 = North-South, 90 = East-West")
+        params_layout.addWidget(self.spin_angle, 2, 1)
+
+        layout.addWidget(params_group)
+
+        # === Path Generation Section ===
+        gen_group = QtWidgets.QGroupBox("Path Generation")
+        gen_layout = QVBoxLayout(gen_group)
+
+        gen_btn_layout = QHBoxLayout()
+        self.btn_generate = QPushButton("Generate Spray Paths")
+        self.btn_generate.setStyleSheet("background-color: #0066cc; color: white; font-weight: bold; padding: 8px;")
+        self.btn_clear_paths = QPushButton("Clear Paths")
+        self.btn_upload = QPushButton("Upload to Vehicle")
+        self.btn_upload.setStyleSheet("background-color: #006600; color: white; font-weight: bold;")
+
+        gen_btn_layout.addWidget(self.btn_generate)
+        gen_btn_layout.addWidget(self.btn_clear_paths)
+        gen_btn_layout.addWidget(self.btn_upload)
+        gen_layout.addLayout(gen_btn_layout)
+
+        layout.addWidget(gen_group)
+
+        # === Mission Statistics Section ===
+        stats_group = QtWidgets.QGroupBox("Mission Statistics")
+        stats_layout = QGridLayout(stats_group)
+
+        self.lbl_rows = QLabel("Spray Rows: 0")
+        self.lbl_distance = QLabel("Total Distance: 0 m")
+        self.lbl_area = QLabel("Coverage Area: 0 m² (0 acres)")
+        self.lbl_time = QLabel("Est. Flight Time: 0 min")
+        self.lbl_waypoints = QLabel("Waypoints: 0")
+
+        stats_layout.addWidget(self.lbl_rows, 0, 0)
+        stats_layout.addWidget(self.lbl_distance, 0, 1)
+        stats_layout.addWidget(self.lbl_area, 1, 0)
+        stats_layout.addWidget(self.lbl_time, 1, 1)
+        stats_layout.addWidget(self.lbl_waypoints, 2, 0)
+
+        layout.addWidget(stats_group)
+
+        # === Progress Section ===
+        progress_group = QtWidgets.QGroupBox("Mission Progress")
+        progress_layout = QVBoxLayout(progress_group)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_label = QLabel("Status: Not Started")
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+
+        layout.addWidget(progress_group)
+
+        layout.addStretch()
+
+        # Connect signals
+        self._connect_signals()
+
+    def _connect_signals(self):
+        """Connect all button signals to handlers"""
+        self.btn_draw_red.clicked.connect(lambda: self._start_zone_drawing(MapWidget.MODE_DRAW_RED_ZONE))
+        self.btn_draw_yellow.clicked.connect(lambda: self._start_zone_drawing(MapWidget.MODE_DRAW_YELLOW_ZONE))
+        self.btn_draw_green.clicked.connect(lambda: self._start_zone_drawing(MapWidget.MODE_DRAW_GREEN_ZONE))
+
+        self.btn_finish_zone.clicked.connect(self._finish_zone)
+        self.btn_cancel_zone.clicked.connect(self._cancel_zone)
+        self.btn_clear_zones.clicked.connect(self._clear_all_zones)
+
+        self.btn_set_takeoff_gps.clicked.connect(self._set_takeoff_from_gps)
+        self.btn_set_takeoff_map.clicked.connect(self._set_takeoff_from_map)
+        self.btn_clear_takeoff.clicked.connect(self._clear_takeoff)
+
+        self.btn_generate.clicked.connect(self._generate_paths)
+        self.btn_clear_paths.clicked.connect(self._clear_paths)
+        self.btn_upload.clicked.connect(self._upload_mission)
+
+        # Connect map zone changes
+        self.map_widget.zonesChanged.connect(self._update_zone_info)
+
+    def _start_zone_drawing(self, mode: int):
+        """Start drawing a zone of the specified type"""
+        # Uncheck other buttons
+        self.btn_draw_red.setChecked(mode == MapWidget.MODE_DRAW_RED_ZONE)
+        self.btn_draw_yellow.setChecked(mode == MapWidget.MODE_DRAW_YELLOW_ZONE)
+        self.btn_draw_green.setChecked(mode == MapWidget.MODE_DRAW_GREEN_ZONE)
+
+        # Check if button was toggled off
+        if not any([self.btn_draw_red.isChecked(), self.btn_draw_yellow.isChecked(), self.btn_draw_green.isChecked()]):
+            self.map_widget.set_drawing_mode(MapWidget.MODE_NORMAL)
+            print("[SprayPlanner] Drawing mode disabled")
+            return
+
+        self.map_widget.set_drawing_mode(mode)
+        mode_name = {
+            MapWidget.MODE_DRAW_RED_ZONE: "RED (No-Fly)",
+            MapWidget.MODE_DRAW_YELLOW_ZONE: "YELLOW (Boundary)",
+            MapWidget.MODE_DRAW_GREEN_ZONE: "GREEN (Spray Area)"
+        }.get(mode, "Unknown")
+        print(f"[SprayPlanner] Started drawing {mode_name} zone - Click on map to add points")
+
+    def _finish_zone(self):
+        """Finish the current zone drawing"""
+        zone = self.map_widget.finish_current_zone()
+        if zone:
+            print(f"[SprayPlanner] Finished {zone.zone_type.name} zone with {len(zone.points)} points")
+            self._update_zone_info()
+
+            # Update mission zones
+            if zone.zone_type == ZoneType.RED:
+                self.mission.no_fly_zones.append(zone)
+            elif zone.zone_type == ZoneType.YELLOW:
+                self.mission.boundary_zone = zone
+            elif zone.zone_type == ZoneType.GREEN:
+                self.mission.spray_area = zone
+
+        # Reset drawing mode
+        self.btn_draw_red.setChecked(False)
+        self.btn_draw_yellow.setChecked(False)
+        self.btn_draw_green.setChecked(False)
+        self.map_widget.set_drawing_mode(MapWidget.MODE_NORMAL)
+
+    def _cancel_zone(self):
+        """Cancel the current zone drawing"""
+        self.map_widget.cancel_current_zone()
+        self.btn_draw_red.setChecked(False)
+        self.btn_draw_yellow.setChecked(False)
+        self.btn_draw_green.setChecked(False)
+        self.map_widget.set_drawing_mode(MapWidget.MODE_NORMAL)
+        print("[SprayPlanner] Zone drawing cancelled")
+
+    def _clear_all_zones(self):
+        """Clear all zones"""
+        reply = QMessageBox.question(self, "Clear All Zones",
+                                     "This will remove all defined zones. Continue?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.map_widget.clear_zones()
+            self.mission.no_fly_zones = []
+            self.mission.boundary_zone = None
+            self.mission.spray_area = None
+            self._update_zone_info()
+            print("[SprayPlanner] All zones cleared")
+
+    def _update_zone_info(self):
+        """Update the zone information label"""
+        zones = self.map_widget.get_zones()
+        red_count = len([z for z in zones if z.zone_type == ZoneType.RED])
+        yellow_count = len([z for z in zones if z.zone_type == ZoneType.YELLOW])
+        green_count = len([z for z in zones if z.zone_type == ZoneType.GREEN])
+        self.zone_info.setText(f"Zones: {red_count} RED | {yellow_count} YELLOW | {green_count} GREEN")
+
+    def _set_takeoff_from_gps(self):
+        """Set takeoff point from current GPS position"""
+        if self._gps_lat is not None and self._gps_lon is not None:
+            self.map_widget.set_takeoff_point(self._gps_lat, self._gps_lon)
+            self.mission.takeoff_point = ZonePoint(self._gps_lat, self._gps_lon)
+            self.takeoff_label.setText(f"GPS: {self._gps_lat:.6f}, {self._gps_lon:.6f}")
+            self.takeoff_label.setStyleSheet("color: #00aa00; font-weight: bold;")
+            print(f"[SprayPlanner] Takeoff point set from GPS: {self._gps_lat:.6f}, {self._gps_lon:.6f}")
+        else:
+            QMessageBox.warning(self, "No GPS",
+                               "No GPS position available. Please connect to the drone first.")
+
+    def _set_takeoff_from_map(self):
+        """Set takeoff point from map center"""
+        lat = self.map_widget.center_lat
+        lon = self.map_widget.center_lon
+        self.map_widget.set_takeoff_point(lat, lon)
+        self.mission.takeoff_point = ZonePoint(lat, lon)
+        self.takeoff_label.setText(f"Map: {lat:.6f}, {lon:.6f}")
+        self.takeoff_label.setStyleSheet("color: #0066cc; font-weight: bold;")
+        print(f"[SprayPlanner] Takeoff point set from map center: {lat:.6f}, {lon:.6f}")
+
+    def _clear_takeoff(self):
+        """Clear takeoff point"""
+        self.map_widget.clear_takeoff_point()
+        self.mission.takeoff_point = None
+        self.takeoff_label.setText("Not Set")
+        self.takeoff_label.setStyleSheet("color: #666; font-style: italic;")
+        print("[SprayPlanner] Takeoff point cleared")
+
+    def _generate_paths(self):
+        """Generate spray paths based on defined zones and parameters"""
+        # Check if spray area is defined
+        green_zones = self.map_widget.get_zones_by_type(ZoneType.GREEN)
+        if not green_zones:
+            QMessageBox.warning(self, "No Spray Area",
+                               "Please draw a GREEN spray area zone first.")
+            return
+
+        # Update mission parameters
+        self.mission.spray_area = green_zones[0]  # Use first green zone
+        self.mission.no_fly_zones = self.map_widget.get_zones_by_type(ZoneType.RED)
+        self.mission.row_spacing = self.spin_row_spacing.value()
+        self.mission.altitude = self.spin_altitude.value()
+        self.mission.speed = self.spin_speed.value()
+        self.mission.swath_width = self.spin_swath.value()
+
+        # Generate paths
+        generator = SprayPathGenerator(self.mission)
+        paths = generator.generate_parallel_paths(angle_deg=self.spin_angle.value())
+
+        if not paths:
+            QMessageBox.warning(self, "Path Generation Failed",
+                               "Could not generate spray paths. Check the spray area definition.")
+            return
+
+        # Generate waypoints
+        waypoints = generator.generate_waypoints()
+
+        # Update visualization
+        self.map_widget.set_spray_paths(paths)
+        self.map_widget.set_waypoints(waypoints)
+
+        # Calculate and display statistics
+        stats = generator.calculate_mission_stats()
+        self._update_statistics(stats)
+
+        print(f"[SprayPlanner] Generated {len(paths)} spray paths and {len(waypoints)} waypoints")
+        self.missionGenerated.emit(waypoints)
+
+    def _update_statistics(self, stats: Dict[str, Any]):
+        """Update mission statistics display"""
+        self.lbl_rows.setText(f"Spray Rows: {stats['num_rows']}")
+        self.lbl_distance.setText(f"Total Distance: {stats['total_distance_m']:.0f} m")
+        self.lbl_area.setText(f"Coverage Area: {stats['area_m2']:.0f} m² ({stats['area_acres']:.2f} acres)")
+        self.lbl_time.setText(f"Est. Flight Time: {stats['estimated_time_min']:.1f} min")
+        self.lbl_waypoints.setText(f"Waypoints: {stats['num_waypoints']}")
+
+    def _clear_paths(self):
+        """Clear generated paths"""
+        self.map_widget.clear_spray_paths()
+        self.map_widget.set_waypoints([])
+        self.mission.spray_paths = []
+        self.mission.waypoints = []
+
+        # Reset statistics
+        self.lbl_rows.setText("Spray Rows: 0")
+        self.lbl_distance.setText("Total Distance: 0 m")
+        self.lbl_area.setText("Coverage Area: 0 m² (0 acres)")
+        self.lbl_time.setText("Est. Flight Time: 0 min")
+        self.lbl_waypoints.setText("Waypoints: 0")
+
+        print("[SprayPlanner] Paths cleared")
+
+    def _upload_mission(self):
+        """Upload generated mission to vehicle"""
+        if not self.mission.waypoints:
+            QMessageBox.warning(self, "No Mission",
+                               "Please generate spray paths first.")
+            return
+
+        reply = QMessageBox.question(self, "Upload Mission",
+                                     f"Upload {len(self.mission.waypoints)} waypoints to vehicle?\n\n"
+                                     f"This will replace any existing mission on the drone.",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.worker.request_write_mission(self.mission.waypoints)
+            print(f"[SprayPlanner] Uploading {len(self.mission.waypoints)} waypoints to vehicle")
+
+    def update_gps_position(self, lat: float, lon: float):
+        """Update the current GPS position (called from status updates)"""
+        self._gps_lat = lat
+        self._gps_lon = lon
+
+    def update_progress(self, current_wp: int, total_wp: int):
+        """Update mission progress"""
+        if total_wp > 0:
+            progress = int((current_wp / total_wp) * 100)
+            self.progress_bar.setValue(progress)
+            self.progress_label.setText(f"Status: Waypoint {current_wp}/{total_wp}")
+
+            # Update path status visualization
+            # Estimate which path we're on based on waypoint (2 WP per path + 1 takeoff + 1 RTL)
+            path_index = max(0, (current_wp - 1) // 2)
+            self.map_widget.set_current_path_index(path_index)
+
+
 # ---------------- Map Dashboard with Planner Tab ----------------
 class MapDashboard(QWidget):
     FOLLOW_SUSPEND_MS = 3500
@@ -1454,14 +2570,16 @@ class MapDashboard(QWidget):
         super().__init__()
         self.worker = worker
 
-        # Two maps: main (with HUD) and planner (no HUD)
+        # Three maps: main (with HUD), planner (no HUD), and spray planner (no HUD)
         self.map = MapWidget(status_provider=statusbar_provider, show_overlays=True)
         self.plan_map = MapWidget(status_provider=statusbar_provider, show_overlays=False)
+        self.spray_map = MapWidget(status_provider=statusbar_provider, show_overlays=False)
 
         # tabs
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_map_tab(), "Map")
         self.tabs.addTab(self._build_plan_tab(), "Plan")
+        self.tabs.addTab(self._build_spray_plan_tab(), "Spray Planner")
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.tabs, 1)
@@ -1470,6 +2588,7 @@ class MapDashboard(QWidget):
         self._suppress_until = 0
         self.map.userInteracted.connect(self._on_user_interaction)
         self.plan_map.userInteracted.connect(self._on_user_interaction)
+        self.spray_map.userInteracted.connect(self._on_user_interaction)
 
         # Status updates -> HUD + autopan
         self.worker.status.connect(self._on_status)
@@ -1484,6 +2603,9 @@ class MapDashboard(QWidget):
         self.table.itemChanged.connect(self._on_table_changed)
         self.plan_map.waypointsChanged.connect(self._on_map_changed)
         self.map.waypointsChanged.connect(self._on_map_changed)
+
+        # Sync spray map with spray planner
+        self.spray_planner.missionGenerated.connect(self._on_spray_mission_generated)
 
     def _build_map_tab(self):
         w = QWidget(); layout = QVBoxLayout(w)
@@ -1500,12 +2622,50 @@ class MapDashboard(QWidget):
 
         layout.addWidget(self.map, 1)
 
-        self.layer.currentTextChanged.connect(lambda k: [self.map.set_provider(k), self.plan_map.set_provider(k)])
-        self.offline.stateChanged.connect(lambda *_: [self.map.set_offline(self.offline.isChecked()), self.plan_map.set_offline(self.offline.isChecked())])
+        self.layer.currentTextChanged.connect(lambda k: [self.map.set_provider(k), self.plan_map.set_provider(k), self.spray_map.set_provider(k)])
+        self.offline.stateChanged.connect(lambda *_: [self.map.set_offline(self.offline.isChecked()), self.plan_map.set_offline(self.offline.isChecked()), self.spray_map.set_offline(self.offline.isChecked())])
         open_mbt.clicked.connect(self._open_mbtiles)
         self.map.set_provider(self.layer.currentText())
         self.plan_map.set_provider(self.layer.currentText())
+        self.spray_map.set_provider(self.layer.currentText())
         return w
+
+    def _build_spray_plan_tab(self):
+        """Build the DJI-like spray path planning tab"""
+        w = QWidget()
+        layout = QHBoxLayout(w)
+
+        # Left side: Map for zone drawing and path visualization
+        map_container = QWidget()
+        map_layout = QVBoxLayout(map_container)
+
+        # Instructions label
+        instructions = QLabel("Draw zones on the map: RED (No-Fly) | YELLOW (Warning/Boundary) | GREEN (Spray Area)")
+        instructions.setStyleSheet("font-weight: bold; padding: 5px; background: #f0f8ff; border: 1px solid #ccc;")
+        map_layout.addWidget(instructions)
+
+        # Spray map
+        self.spray_map.setMinimumHeight(400)
+        map_layout.addWidget(self.spray_map, 1)
+
+        # Right side: Spray Planner Panel
+        self.spray_planner = SprayPlannerPanel(self.spray_map, self.worker)
+        self.spray_planner.setFixedWidth(380)
+
+        layout.addWidget(map_container, 1)
+        layout.addWidget(self.spray_planner)
+
+        return w
+
+    def _on_spray_mission_generated(self, waypoints: List[WP]):
+        """Handle spray mission generation - sync to other maps and table"""
+        print(f"[MapDashboard] Spray mission generated with {len(waypoints)} waypoints")
+        # Sync waypoints to the plan tab and main map
+        self.table.blockSignals(True)
+        self.table.load(waypoints)
+        self.table.blockSignals(False)
+        self.map.set_waypoints(waypoints)
+        self.plan_map.set_waypoints(waypoints)
 
     def _build_plan_tab(self):
         w = QWidget(); v = QVBoxLayout(w)
@@ -1808,13 +2968,15 @@ class MapDashboard(QWidget):
         try:
             if self.map.mbtiles: self.map.mbtiles.close()
             if self.plan_map.mbtiles: self.plan_map.mbtiles.close()
+            if self.spray_map.mbtiles: self.spray_map.mbtiles.close()
             prov = MBTilesProvider(Path(fn))
             if not prov.valid:
                 QMessageBox.warning(self,"MBTiles","Invalid file."); return
             # Use separate providers so their sqlite connections don't fight
             self.map.mbtiles = prov
             self.plan_map.mbtiles = MBTilesProvider(Path(fn))
-            self.map.update(); self.plan_map.update()
+            self.spray_map.mbtiles = MBTilesProvider(Path(fn))
+            self.map.update(); self.plan_map.update(); self.spray_map.update()
         except Exception as e:
             QMessageBox.critical(self,"MBTiles",str(e))
 
@@ -1825,11 +2987,20 @@ class MapDashboard(QWidget):
         self._suppress_until = max(self._suppress_until, now + ms)
 
     def _on_status(self, d: dict):
+        # Update GPS position for spray planner
+        lat = d.get("_gps_lat")
+        lon = d.get("_gps_lon")
+        if lat is not None and lon is not None:
+            # Update spray planner with GPS position for takeoff point
+            if hasattr(self, 'spray_planner'):
+                self.spray_planner.update_gps_position(lat, lon)
+            # Update drone position on spray map
+            if hasattr(self, 'spray_map'):
+                self.spray_map.set_drone_position(lat, lon)
+
         if self.autopan.isChecked():
             now = time.time() * 1000.0
             if now >= self._suppress_until:
-                lat = d.get("_gps_lat")
-                lon = d.get("_gps_lon")
                 if lat is not None and lon is not None:
                     self.map.recenter(lat, lon)
                     # keep the plan map near the same area but do not fight user during planning
