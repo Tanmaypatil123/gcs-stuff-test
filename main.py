@@ -5,7 +5,7 @@
 # - Read / Write / Clear missions with popups
 # - High-contrast markers and indices
 
-import sys, time, re, threading, datetime, math, sqlite3, queue
+import sys, time, re, threading, datetime, math, sqlite3, queue, json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -26,8 +26,44 @@ PREFERRED_PORTS = ["COM5", "COM4"]
 BAUDS = [115200, 57600, 38400, 9600]
 TILE_SIZE = 256
 CACHE_DIR = Path("./tile_cache").resolve()
+GPS_CONFIG_FILE = Path("./gcs_last_location.json").resolve()
+
+# Default location (India center) - used if no saved location exists
+DEFAULT_LAT = 20.5937
+DEFAULT_LON = 78.9629
 
 def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
+
+def load_saved_gps_location() -> Tuple[float, float, Optional[float]]:
+    """Load last known GPS location from config file.
+    Returns (lat, lon, alt) tuple. Uses defaults if file doesn't exist."""
+    try:
+        if GPS_CONFIG_FILE.exists():
+            with open(GPS_CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                lat = data.get('last_gps_lat', DEFAULT_LAT)
+                lon = data.get('last_gps_lon', DEFAULT_LON)
+                alt = data.get('last_gps_alt')
+                print(f"[GPS Config] Loaded saved location: ({lat:.6f}, {lon:.6f})")
+                return (lat, lon, alt)
+    except Exception as e:
+        print(f"[GPS Config] Could not load saved location: {e}")
+    return (DEFAULT_LAT, DEFAULT_LON, None)
+
+def save_gps_location(lat: float, lon: float, alt: Optional[float] = None):
+    """Save GPS location to config file for persistence."""
+    try:
+        data = {
+            'last_gps_lat': lat,
+            'last_gps_lon': lon,
+            'last_gps_alt': alt,
+            'saved_at': datetime.datetime.now().isoformat()
+        }
+        with open(GPS_CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"[GPS Config] Saved location: ({lat:.6f}, {lon:.6f})")
+    except Exception as e:
+        print(f"[GPS Config] Could not save location: {e}")
 
 def win_path(port: str) -> str:
     m = re.match(r"^COM(\d+)$", port.upper())
@@ -1198,7 +1234,9 @@ class MapWidget(QWidget):
         super().__init__()
         self.setMouseTracking(True)
         self.zoom=5; self.min_zoom=1; self.max_zoom=19
-        self.center_lat=20.5937; self.center_lon=78.9629
+        # Load saved GPS location as default map center
+        saved_lat, saved_lon, _ = load_saved_gps_location()
+        self.center_lat=saved_lat; self.center_lon=saved_lon
         self.cache = DiskCache(CACHE_DIR)
         self.http = HttpTileProvider(PROVIDERS["ESRI Satellite"]["template"], self.cache)
         self.http.tile_available.connect(lambda *_: self.update())
@@ -1471,8 +1509,23 @@ class MapDashboard(QWidget):
         self.map.userInteracted.connect(self._on_user_interaction)
         self.plan_map.userInteracted.connect(self._on_user_interaction)
 
+        # GPS tracking state for auto-focus and auto-WP0
+        self._first_gps_received = False  # True after first valid GPS fix
+        self._last_gps_lat = None  # Current GPS lat
+        self._last_gps_lon = None  # Current GPS lon
+        self._last_gps_alt = None  # Current GPS alt
+        self._plan_map_focused = False  # True after Plan map has been auto-focused
+        self._wp0_auto_created = False  # True if WP0 was auto-created from GPS
+
         # Status updates -> HUD + autopan
         self.worker.status.connect(self._on_status)
+
+        # Connect to worker signals for connection state tracking
+        self.worker.connected.connect(self._on_drone_connected)
+        self.worker.disconnected.connect(self._on_drone_disconnected)
+
+        # Tab change detection for auto-WP0 creation
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # mission signals
         self.worker.mission_read_ok.connect(self._on_mission_read)
@@ -1484,6 +1537,23 @@ class MapDashboard(QWidget):
         self.table.itemChanged.connect(self._on_table_changed)
         self.plan_map.waypointsChanged.connect(self._on_map_changed)
         self.map.waypointsChanged.connect(self._on_map_changed)
+
+    def _on_drone_connected(self, port, baud, info):
+        """Called when drone connects - reset GPS tracking state."""
+        print(f"[MapDashboard] Drone connected, resetting GPS tracking state")
+        self._first_gps_received = False
+        self._plan_map_focused = False
+        self._wp0_auto_created = False
+
+    def _on_drone_disconnected(self, reason):
+        """Called when drone disconnects."""
+        print(f"[MapDashboard] Drone disconnected: {reason}")
+        # GPS location is already saved, so next time app starts it will use saved location
+
+    def _on_tab_changed(self, index):
+        """Called when user switches tabs. Auto-creates WP0 when entering Plan tab."""
+        if index == 1:  # Plan tab
+            self._auto_create_wp0_from_gps()
 
     def _build_map_tab(self):
         w = QWidget(); layout = QVBoxLayout(w)
@@ -1573,6 +1643,65 @@ class MapDashboard(QWidget):
         wps = self.table.to_list()
         self.map.set_waypoints(wps)
         self.plan_map.set_waypoints(wps)
+
+    # ------ GPS-based auto-WP0 creation ------
+    def _auto_create_wp0_from_gps(self):
+        """Auto-create WP0 (takeoff waypoint) at drone's GPS location.
+
+        This is called when:
+        1. User switches to Plan tab and we have valid GPS
+        2. First GPS fix is received while on Plan tab
+
+        Only creates WP0 if:
+        - No waypoints exist yet
+        - We have valid GPS coordinates
+        - WP0 hasn't been auto-created already in this session
+        """
+        # Check if we already have waypoints
+        wps = self.table.to_list()
+        if wps:
+            print(f"[MapDashboard] Auto-WP0 skipped: already have {len(wps)} waypoint(s)")
+            return
+
+        # Check if we've already auto-created WP0 this session
+        if self._wp0_auto_created:
+            print("[MapDashboard] Auto-WP0 skipped: already created this session")
+            return
+
+        # Check if we have valid GPS
+        if self._last_gps_lat is None or self._last_gps_lon is None:
+            print("[MapDashboard] Auto-WP0 skipped: no valid GPS data available")
+            return
+
+        # Create WP0 at drone's GPS location
+        lat = self._last_gps_lat
+        lon = self._last_gps_lon
+        alt = self._last_gps_alt if self._last_gps_alt is not None else 30.0
+        default_takeoff_alt = 30.0  # Default takeoff altitude
+
+        print(f"[MapDashboard] Auto-creating WP0 (TAKEOFF) at drone GPS location: ({lat:.6f}, {lon:.6f})")
+
+        # Create takeoff waypoint at drone's location
+        wps = [WP(cmd=CMD_TAKEOFF, lat=lat, lon=lon, alt=default_takeoff_alt)]
+
+        # Update table and maps
+        self.table.blockSignals(True)
+        self.table.load(wps)
+        self.table.blockSignals(False)
+        self.map.set_waypoints(wps)
+        self.plan_map.set_waypoints(wps)
+
+        # Center plan map on the waypoint and zoom in
+        self.plan_map.recenter(lat, lon)
+        self.plan_map.zoom = max(16, self.plan_map.zoom)
+        self.plan_map.update()
+
+        # Mark as created so we don't do it again
+        self._wp0_auto_created = True
+
+        # Log to user
+        self.worker.L(f"Auto-created WP0 (TAKEOFF) at drone location ({lat:.5f}, {lon:.5f})")
+        print(f"[MapDashboard] WP0 auto-created successfully")
 
     # ------ mission actions ------
     def _delete_selected(self):
@@ -1825,11 +1954,43 @@ class MapDashboard(QWidget):
         self._suppress_until = max(self._suppress_until, now + ms)
 
     def _on_status(self, d: dict):
+        # Track GPS data for auto-focus and WP0 creation
+        lat = d.get("_gps_lat")
+        lon = d.get("_gps_lon")
+        alt = d.get("_alt")
+        fix = d.get("_fix")
+
+        # Check for valid GPS fix (3D or better)
+        is_valid_fix = fix in ['3D', 'RTK_FIXED', 'RTK_FLOAT', 'DGPS']
+
+        if lat is not None and lon is not None and is_valid_fix:
+            # Update tracked GPS position
+            self._last_gps_lat = lat
+            self._last_gps_lon = lon
+            self._last_gps_alt = alt
+
+            # Save GPS location to config file (throttled - only save occasionally)
+            # We'll save on first fix and then periodically
+            if not self._first_gps_received:
+                self._first_gps_received = True
+                save_gps_location(lat, lon, alt)
+                print(f"[MapDashboard] First GPS fix received: ({lat:.6f}, {lon:.6f})")
+
+                # Auto-focus Plan map on drone location (first time only)
+                if not self._plan_map_focused:
+                    self._plan_map_focused = True
+                    self.plan_map.recenter(lat, lon)
+                    self.plan_map.zoom = max(15, self.plan_map.zoom)  # Zoom in for better detail
+                    self.plan_map.update()
+                    print(f"[MapDashboard] Auto-focused Plan map on drone location")
+
+                # If already on Plan tab, try to auto-create WP0
+                if self.tabs.currentIndex() == 1:
+                    self._auto_create_wp0_from_gps()
+
         if self.autopan.isChecked():
             now = time.time() * 1000.0
             if now >= self._suppress_until:
-                lat = d.get("_gps_lat")
-                lon = d.get("_gps_lon")
                 if lat is not None and lon is not None:
                     self.map.recenter(lat, lon)
                     # keep the plan map near the same area but do not fight user during planning
