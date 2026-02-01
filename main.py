@@ -1607,6 +1607,11 @@ class MapWidget(QWidget):
         # Generated path (green lines)
         self._generated_path: List[WP] = []
 
+        # Drone position from GPS
+        self._drone_lat: Optional[float] = None
+        self._drone_lon: Optional[float] = None
+        self._drone_heading: float = 0.0  # Yaw/heading in degrees
+
         # overlays optional on plan map
         self.hud = HUDPanel() if show_overlays else None
         self.ahrs = AHRSWidget() if show_overlays else None
@@ -1794,6 +1799,27 @@ class MapWidget(QWidget):
     def clear_generated_path(self):
         """Clear the generated path"""
         self._generated_path = []
+        self.update()
+
+    # Drone position methods
+    def set_drone_position(self, lat: float, lon: float, heading: float = 0.0):
+        """Set the drone's GPS position and heading"""
+        self._drone_lat = lat
+        self._drone_lon = lon
+        self._drone_heading = heading
+        self.update()
+
+    def get_drone_position(self) -> Optional[Tuple[float, float]]:
+        """Get the drone's current position"""
+        if self._drone_lat is not None and self._drone_lon is not None:
+            return (self._drone_lat, self._drone_lon)
+        return None
+
+    def clear_drone_position(self):
+        """Clear the drone position"""
+        self._drone_lat = None
+        self._drone_lon = None
+        self._drone_heading = 0.0
         self.update()
 
     def set_waypoints(self, wps: List[WP]):
@@ -2030,7 +2056,7 @@ class MapWidget(QWidget):
                     p.setPen(QtGui.QColor(200, 0, 0))
                     p.drawText(center_x - 20, center_y, f"NO-FLY")
 
-        # draw current red zone being drawn (dashed red)
+        # draw current red zone being drawn (solid polygon like yellow zone)
         if self._current_red_zone:
             curr_rz_pts = []
             for lat, lon in self._current_red_zone:
@@ -2040,25 +2066,34 @@ class MapWidget(QWidget):
 
             p.setRenderHint(QPainter.Antialiasing, True)
 
-            # Draw dashed lines
-            pen = QPen(QtGui.QColor(255, 0, 0), 2, Qt.DashLine)
-            p.setPen(pen)
-            for i in range(len(curr_rz_pts) - 1):
-                p.drawLine(curr_rz_pts[i][0], curr_rz_pts[i][1],
-                          curr_rz_pts[i+1][0], curr_rz_pts[i+1][1])
+            # Draw filled polygon with semi-transparent red (like yellow zone)
+            if len(curr_rz_pts) >= 3:
+                poly_points = [QtCore.QPoint(x, y) for x, y in curr_rz_pts]
+                polygon = QtGui.QPolygon(poly_points)
+                p.setBrush(QtGui.QColor(255, 0, 0, 50))  # Semi-transparent red fill
+                p.setPen(QPen(QtGui.QColor(255, 50, 50), 3))  # Red border
+                p.drawPolygon(polygon)
 
-            # Draw points
+            # Draw red lines connecting points (solid like yellow zone)
+            p.setPen(QPen(QtGui.QColor(255, 50, 50), 3))
+            for i in range(len(curr_rz_pts)):
+                p.drawLine(curr_rz_pts[i][0], curr_rz_pts[i][1],
+                          curr_rz_pts[(i+1) % len(curr_rz_pts)][0],
+                          curr_rz_pts[(i+1) % len(curr_rz_pts)][1])
+
+            # Draw points with labels
             for i, (sx, sy) in enumerate(curr_rz_pts):
-                p.setBrush(QtGui.QColor(255, 100, 100))
+                # Red marker
+                p.setBrush(QtGui.QColor(255, 50, 50))
                 p.setPen(QPen(Qt.black, 2))
-                p.drawEllipse(QtCore.QPoint(sx, sy), 5, 5)
+                p.drawEllipse(QtCore.QPoint(sx, sy), 6, 6)
                 # Label
                 label = f"R{i}"
-                font = QFont("Consolas", 8); font.setBold(True); p.setFont(font)
-                p.setPen(QPen(Qt.black, 2))
-                p.drawText(sx + 6, sy - 6, label)
+                font = QFont("Consolas", 9); font.setBold(True); p.setFont(font)
+                p.setPen(QPen(Qt.black, 3))
+                p.drawText(sx + 8, sy - 8, label)
                 p.setPen(QtGui.QColor(255, 50, 50))
-                p.drawText(sx + 6, sy - 6, label)
+                p.drawText(sx + 8, sy - 8, label)
 
         # draw START point (large green marker)
         if self._start_point:
@@ -2177,6 +2212,60 @@ class MapWidget(QWidget):
                 p.drawText(sx+10, sy-10, label)
                 p.setPen(Qt.white)
                 p.drawText(sx+10, sy-10, label)
+
+        # Draw DRONE ICON at GPS position
+        if self._drone_lat is not None and self._drone_lon is not None:
+            px, py = self.latlon_to_pixels(self._drone_lat, self._drone_lon, self.zoom)
+            dx = int(px - tlx)
+            dy = int(py - tly)
+
+            p.setRenderHint(QPainter.Antialiasing, True)
+
+            # Save painter state for rotation
+            p.save()
+            p.translate(dx, dy)
+            p.rotate(self._drone_heading)  # Rotate to heading
+
+            # Draw drone icon - quadcopter shape
+            drone_size = 20  # Size of drone icon
+
+            # Drone body (circle)
+            p.setBrush(QtGui.QColor(0, 150, 255, 200))  # Blue with transparency
+            p.setPen(QPen(Qt.white, 2))
+            p.drawEllipse(-drone_size//3, -drone_size//3, drone_size*2//3, drone_size*2//3)
+
+            # Draw 4 arms and rotors (quadcopter)
+            arm_length = drone_size
+            rotor_size = drone_size // 3
+
+            # Arms (diagonal lines)
+            p.setPen(QPen(QtGui.QColor(50, 50, 50), 3))
+            p.drawLine(-arm_length//2, -arm_length//2, arm_length//2, arm_length//2)
+            p.drawLine(-arm_length//2, arm_length//2, arm_length//2, -arm_length//2)
+
+            # Rotors (circles at arm ends)
+            p.setBrush(QtGui.QColor(100, 100, 100, 180))
+            p.setPen(QPen(Qt.black, 1))
+            # Top-left rotor
+            p.drawEllipse(-arm_length//2 - rotor_size//2, -arm_length//2 - rotor_size//2, rotor_size, rotor_size)
+            # Top-right rotor
+            p.drawEllipse(arm_length//2 - rotor_size//2, -arm_length//2 - rotor_size//2, rotor_size, rotor_size)
+            # Bottom-left rotor
+            p.drawEllipse(-arm_length//2 - rotor_size//2, arm_length//2 - rotor_size//2, rotor_size, rotor_size)
+            # Bottom-right rotor
+            p.drawEllipse(arm_length//2 - rotor_size//2, arm_length//2 - rotor_size//2, rotor_size, rotor_size)
+
+            # Front indicator (arrow pointing forward)
+            p.setBrush(QtGui.QColor(255, 100, 0))  # Orange for front
+            p.setPen(Qt.NoPen)
+            front_arrow = QtGui.QPolygon([
+                QtCore.QPoint(0, -drone_size - 5),
+                QtCore.QPoint(-5, -drone_size + 2),
+                QtCore.QPoint(5, -drone_size + 2)
+            ])
+            p.drawPolygon(front_arrow)
+
+            p.restore()
 
         p.setPen(Qt.black); p.drawText(10, self.height()-10, f"Lat {self.center_lat:.5f}  Lon {self.center_lon:.5f}  Zoom {self.zoom}")
 
@@ -3299,14 +3388,25 @@ while avoiding no-fly zones and respecting custom start/end points.</p>
         self._suppress_until = max(self._suppress_until, now + ms)
 
     def _on_status(self, d: dict):
-        if self.autopan.isChecked():
-            now = time.time() * 1000.0
-            if now >= self._suppress_until:
-                lat = d.get("_gps_lat")
-                lon = d.get("_gps_lon")
-                if lat is not None and lon is not None:
+        # Update drone position on map
+        lat = d.get("_gps_lat")
+        lon = d.get("_gps_lon")
+        yaw = d.get("_yaw", 0.0)
+
+        if lat is not None and lon is not None:
+            # Update drone icon position on both maps
+            self.map.set_drone_position(lat, lon, yaw if yaw else 0.0)
+            self.plan_map.set_drone_position(lat, lon, yaw if yaw else 0.0)
+
+            # Auto-pan to follow drone if enabled
+            if self.autopan.isChecked():
+                now = time.time() * 1000.0
+                if now >= self._suppress_until:
                     self.map.recenter(lat, lon)
-                    # keep the plan map near the same area but do not fight user during planning
+                    # Zoom to appropriate level if too zoomed out
+                    if self.map.zoom < 15:
+                        self.map.zoom = 15
+                        self.map.update()
 
         # HUD overlay on main map
         if self.map.hud:
