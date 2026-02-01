@@ -110,25 +110,15 @@ class WP:
     p4: float = 0.0
     frame: int = 6  # MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
 
-# ---------------- Boundary Zone Types ----------------
-ZONE_CRITICAL = "critical"   # Red - Drone should NEVER enter this zone
-ZONE_WARNING = "warning"     # Yellow - Drone can enter but operations restricted / failsafe may trigger
+# ---------------- Geofence Boundary ----------------
+# RED Zone = Outer boundary (critical/no-fly zone) - User draws this
+# YELLOW Zone = Inner buffer zone auto-generated inside RED with adjustable width
 
 @dataclass
-class BoundaryZone:
-    """Defines a circular boundary zone for geofencing.
-
-    zone_type: ZONE_CRITICAL (red) or ZONE_WARNING (yellow)
-    center_lat: Center latitude of the zone
-    center_lon: Center longitude of the zone
-    radius_m: Radius of the zone in meters
-    name: Optional name for the zone
-    """
-    zone_type: str
-    center_lat: float
-    center_lon: float
-    radius_m: float
-    name: str = ""
+class BoundaryPoint:
+    """A single point in a boundary polygon."""
+    lat: float
+    lon: float
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance between two GPS coordinates in meters using Haversine formula."""
@@ -143,10 +133,69 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
     return R * c
 
+def meters_to_degrees(meters: float, lat: float) -> Tuple[float, float]:
+    """Convert meters to approximate degrees at given latitude.
+    Returns (lat_degrees, lon_degrees) for the given meters."""
+    # 1 degree latitude is approximately 111,320 meters
+    lat_deg = meters / 111320.0
+    # 1 degree longitude varies with latitude
+    lon_deg = meters / (111320.0 * math.cos(math.radians(lat))) if math.cos(math.radians(lat)) != 0 else 0
+    return lat_deg, lon_deg
+
+def offset_polygon_inward(points: List[BoundaryPoint], offset_meters: float) -> List[BoundaryPoint]:
+    """Create an inward-offset polygon (shrink) by the given meters.
+    This creates the yellow zone inside the red zone."""
+    if len(points) < 3:
+        return points[:]
+
+    # Calculate centroid
+    centroid_lat = sum(p.lat for p in points) / len(points)
+    centroid_lon = sum(p.lon for p in points) / len(points)
+
+    # Move each point toward centroid by offset amount
+    result = []
+    for p in points:
+        # Calculate direction from point to centroid
+        dlat = centroid_lat - p.lat
+        dlon = centroid_lon - p.lon
+
+        # Calculate distance to centroid
+        dist = haversine_distance(p.lat, p.lon, centroid_lat, centroid_lon)
+
+        if dist > 0:
+            # Calculate how much to move (as fraction of distance to centroid)
+            lat_offset, lon_offset = meters_to_degrees(offset_meters, p.lat)
+
+            # Normalize and apply offset
+            factor = offset_meters / dist if dist > offset_meters else 0.9
+            new_lat = p.lat + dlat * factor
+            new_lon = p.lon + dlon * factor
+            result.append(BoundaryPoint(new_lat, new_lon))
+        else:
+            result.append(BoundaryPoint(p.lat, p.lon))
+
+    return result
+
+def point_in_polygon(lat: float, lon: float, polygon: List[BoundaryPoint]) -> bool:
+    """Check if a point is inside a polygon using ray casting algorithm."""
+    if len(polygon) < 3:
+        return False
+
+    n = len(polygon)
+    inside = False
+
+    j = n - 1
+    for i in range(n):
+        if ((polygon[i].lon > lon) != (polygon[j].lon > lon) and
+            lat < (polygon[j].lat - polygon[i].lat) * (lon - polygon[i].lon) /
+                  (polygon[j].lon - polygon[i].lon) + polygon[i].lat):
+            inside = not inside
+        j = i
+
+    return inside
+
 def meters_to_pixels_at_zoom(meters: float, lat: float, zoom: int) -> float:
     """Convert meters to pixels at a given zoom level and latitude."""
-    # At the equator, one pixel at zoom 0 is approximately 156543 meters
-    # At other latitudes, this is scaled by cos(latitude)
     meters_per_pixel = 156543.03392 * math.cos(math.radians(lat)) / (2 ** zoom)
     return meters / meters_per_pixel if meters_per_pixel > 0 else 0
 
@@ -1233,7 +1282,8 @@ class HUDPanel(QWidget):
 class MapWidget(QWidget):
     userInteracted = pyqtSignal(int)
     waypointsChanged = pyqtSignal(list)  # emits List[WP] whenever WPs change on this map
-    boundaryViolation = pyqtSignal(str, str)  # emits (zone_type, zone_name) when drone enters a boundary
+    boundaryChanged = pyqtSignal()  # emits when boundary polygon changes
+    boundaryViolation = pyqtSignal(str)  # emits zone type when drone violates boundary
 
     def __init__(self, status_provider=lambda: None, show_overlays: bool = True):
         super().__init__()
@@ -1258,9 +1308,12 @@ class MapWidget(QWidget):
         self._drone_yaw: float = 0.0  # Heading in degrees (0 = North)
         self._drone_visible: bool = False
 
-        # Boundary zones (geofencing)
-        self._boundary_zones: List[BoundaryZone] = []
-        self._last_violation_zone: Optional[str] = None  # Track last violation to avoid spam
+        # Polygon boundary (RED = outer no-fly, YELLOW = auto-generated inner buffer)
+        self._red_boundary: List[BoundaryPoint] = []  # User-drawn outer boundary
+        self._yellow_boundary: List[BoundaryPoint] = []  # Auto-generated inner buffer
+        self._yellow_buffer_meters: float = 50.0  # Default buffer width in meters
+        self._draw_boundary_mode: bool = False  # True when drawing boundary
+        self._last_violation: Optional[str] = None
 
         # overlays optional on plan map
         self.hud = HUDPanel() if show_overlays else None
@@ -1320,82 +1373,129 @@ class MapWidget(QWidget):
             return (self._drone_lat, self._drone_lon, self._drone_yaw)
         return None
 
-    # Boundary zone methods
-    def set_boundary_zones(self, zones: List[BoundaryZone]):
-        """Set the boundary zones for geofencing."""
-        self._boundary_zones = zones[:]
+    # Boundary drawing mode
+    def set_draw_boundary_mode(self, enabled: bool):
+        """Enable/disable boundary drawing mode."""
+        self._draw_boundary_mode = enabled
+        if enabled:
+            self.add_mode = False  # Disable waypoint adding when drawing boundary
         self.update()
 
-    def add_boundary_zone(self, zone: BoundaryZone):
-        """Add a single boundary zone."""
-        self._boundary_zones.append(zone)
+    def is_draw_boundary_mode(self) -> bool:
+        return self._draw_boundary_mode
+
+    # Polygon boundary methods
+    def set_red_boundary(self, points: List[BoundaryPoint]):
+        """Set the RED (outer) boundary polygon and auto-generate yellow zone."""
+        self._red_boundary = points[:]
+        self._regenerate_yellow_boundary()
+        self.boundaryChanged.emit()
         self.update()
 
-    def clear_boundary_zones(self):
-        """Clear all boundary zones."""
-        self._boundary_zones.clear()
-        self._last_violation_zone = None
+    def add_boundary_point(self, lat: float, lon: float):
+        """Add a point to the RED boundary polygon."""
+        self._red_boundary.append(BoundaryPoint(lat, lon))
+        self._regenerate_yellow_boundary()
+        self.boundaryChanged.emit()
         self.update()
 
-    def get_boundary_zones(self) -> List[BoundaryZone]:
-        """Return a copy of all boundary zones."""
-        return self._boundary_zones[:]
+    def close_boundary(self):
+        """Close the boundary polygon (connect last point to first)."""
+        if len(self._red_boundary) >= 3:
+            self._regenerate_yellow_boundary()
+            self.boundaryChanged.emit()
+        self.update()
+
+    def clear_boundary(self):
+        """Clear all boundary points."""
+        self._red_boundary.clear()
+        self._yellow_boundary.clear()
+        self._last_violation = None
+        self.boundaryChanged.emit()
+        self.update()
+
+    def get_red_boundary(self) -> List[BoundaryPoint]:
+        return self._red_boundary[:]
+
+    def get_yellow_boundary(self) -> List[BoundaryPoint]:
+        return self._yellow_boundary[:]
+
+    def set_yellow_buffer(self, meters: float):
+        """Set the width of the yellow buffer zone in meters."""
+        self._yellow_buffer_meters = max(10.0, meters)  # Minimum 10m buffer
+        self._regenerate_yellow_boundary()
+        self.update()
+
+    def get_yellow_buffer(self) -> float:
+        return self._yellow_buffer_meters
+
+    def _regenerate_yellow_boundary(self):
+        """Regenerate the yellow boundary inside the red boundary."""
+        if len(self._red_boundary) >= 3:
+            self._yellow_boundary = offset_polygon_inward(
+                self._red_boundary, self._yellow_buffer_meters
+            )
+        else:
+            self._yellow_boundary = []
 
     def _check_boundary_violations(self):
-        """Check if drone is inside any boundary zone and emit signals."""
+        """Check if drone is inside boundary zones and emit signals."""
         if self._drone_lat is None or self._drone_lon is None:
             return
+        if len(self._red_boundary) < 3:
+            return
+
+        # Check if drone is OUTSIDE the red boundary (violation - entered no-fly zone)
+        in_red = point_in_polygon(self._drone_lat, self._drone_lon, self._red_boundary)
+        in_yellow = point_in_polygon(self._drone_lat, self._drone_lon, self._yellow_boundary) if self._yellow_boundary else False
 
         current_violation = None
-        for zone in self._boundary_zones:
-            distance = haversine_distance(
-                self._drone_lat, self._drone_lon,
-                zone.center_lat, zone.center_lon
-            )
-            if distance <= zone.radius_m:
-                # Drone is inside this zone
-                if zone.zone_type == ZONE_CRITICAL:
-                    current_violation = (ZONE_CRITICAL, zone.name)
-                    break  # Critical takes priority
-                elif zone.zone_type == ZONE_WARNING and current_violation is None:
-                    current_violation = (ZONE_WARNING, zone.name)
+        if not in_red:
+            # Outside red boundary = in the critical/no-fly zone
+            current_violation = "critical"
+        elif not in_yellow and in_red:
+            # Inside red but outside yellow = warning zone (buffer area)
+            current_violation = "warning"
+        # else: inside yellow = safe operating zone
 
-        # Emit signal only if violation state changed
-        if current_violation:
-            violation_key = f"{current_violation[0]}:{current_violation[1]}"
-            if violation_key != self._last_violation_zone:
-                self._last_violation_zone = violation_key
-                self.boundaryViolation.emit(current_violation[0], current_violation[1])
-        else:
-            self._last_violation_zone = None
+        if current_violation != self._last_violation:
+            self._last_violation = current_violation
+            if current_violation:
+                self.boundaryViolation.emit(current_violation)
 
     def is_in_critical_zone(self) -> bool:
-        """Check if drone is currently in a critical (red) zone."""
+        """Check if drone is outside the red boundary (no-fly zone)."""
         if self._drone_lat is None or self._drone_lon is None:
             return False
-        for zone in self._boundary_zones:
-            if zone.zone_type == ZONE_CRITICAL:
-                distance = haversine_distance(
-                    self._drone_lat, self._drone_lon,
-                    zone.center_lat, zone.center_lon
-                )
-                if distance <= zone.radius_m:
-                    return True
-        return False
+        if len(self._red_boundary) < 3:
+            return False
+        return not point_in_polygon(self._drone_lat, self._drone_lon, self._red_boundary)
 
     def is_in_warning_zone(self) -> bool:
-        """Check if drone is currently in a warning (yellow) zone."""
+        """Check if drone is in the yellow buffer zone (between red and yellow)."""
         if self._drone_lat is None or self._drone_lon is None:
             return False
-        for zone in self._boundary_zones:
-            if zone.zone_type == ZONE_WARNING:
-                distance = haversine_distance(
-                    self._drone_lat, self._drone_lon,
-                    zone.center_lat, zone.center_lon
-                )
-                if distance <= zone.radius_m:
-                    return True
-        return False
+        if len(self._red_boundary) < 3:
+            return False
+        in_red = point_in_polygon(self._drone_lat, self._drone_lon, self._red_boundary)
+        in_yellow = point_in_polygon(self._drone_lat, self._drone_lon, self._yellow_boundary) if self._yellow_boundary else False
+        return in_red and not in_yellow
+
+    def is_in_safe_zone(self) -> bool:
+        """Check if drone is inside the yellow zone (safe operating area)."""
+        if self._drone_lat is None or self._drone_lon is None:
+            return False
+        if len(self._yellow_boundary) < 3:
+            return False
+        return point_in_polygon(self._drone_lat, self._drone_lon, self._yellow_boundary)
+
+    def undo_last_boundary_point(self):
+        """Remove the last added boundary point."""
+        if self._red_boundary:
+            self._red_boundary.pop()
+            self._regenerate_yellow_boundary()
+            self.boundaryChanged.emit()
+            self.update()
 
     # conversions
     def latlon_to_pixels(self, lat, lon, z):
@@ -1434,13 +1534,21 @@ class MapWidget(QWidget):
 
     def mousePressEvent(self, e: QtGui.QMouseEvent):
         if e.button() == Qt.LeftButton:
+            w,h=self.width(),self.height()
+            cx,cy=self.latlon_to_pixels(self.center_lat,self.center_lon,self.zoom)
+            tlx,tly=cx-w/2,cy-h/2
+            px,py=tlx+e.pos().x(),tly+e.pos().y()
+            lat,lon=self.pixels_to_latlon(px,py,self.zoom)
+
+            if self._draw_boundary_mode:
+                # Add a boundary point at click
+                self.add_boundary_point(lat, lon)
+                print(f"[Boundary] Added point {len(self._red_boundary)}: ({lat:.7f}, {lon:.7f})")
+                self.userInteracted.emit(3500)
+                e.accept(); return
+
             if self.add_mode:
                 # Add a waypoint at click
-                w,h=self.width(),self.height()
-                cx,cy=self.latlon_to_pixels(self.center_lat,self.center_lon,self.zoom)
-                tlx,tly=cx-w/2,cy-h/2
-                px,py=tlx+e.pos().x(),tly+e.pos().y()
-                lat,lon=self.pixels_to_latlon(px,py,self.zoom)
                 default_alt = 30.0 if not self._wps else self._wps[-1].alt
                 cmd = CMD_WAYPOINT if self._wps else CMD_TAKEOFF
                 wp_num = len(self._wps)
@@ -1450,8 +1558,14 @@ class MapWidget(QWidget):
                 self.waypointsChanged.emit(self.get_waypoints())
                 self.userInteracted.emit(3500)
                 e.accept(); return
+
             self._drag = True; self._last = e.pos()
             self.userInteracted.emit(3500); e.accept()
+        elif e.button() == Qt.RightButton and self._draw_boundary_mode:
+            # Right-click to undo last boundary point
+            self.undo_last_boundary_point()
+            print(f"[Boundary] Undone last point. Points remaining: {len(self._red_boundary)}")
+            e.accept()
         else:
             e.ignore()
 
@@ -1509,57 +1623,53 @@ class MapWidget(QWidget):
 
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # Draw boundary zones (red critical zones first, then yellow warning zones)
-        # Sort to draw warning zones first so critical zones appear on top
-        sorted_zones = sorted(self._boundary_zones, key=lambda z: 0 if z.zone_type == ZONE_WARNING else 1)
-        for zone in sorted_zones:
-            zone_px, zone_py = self.latlon_to_pixels(zone.center_lat, zone.center_lon, self.zoom)
-            zone_sx = int(zone_px - tlx)
-            zone_sy = int(zone_py - tly)
-            radius_pixels = meters_to_pixels_at_zoom(zone.radius_m, zone.center_lat, self.zoom)
+        # Draw RED boundary polygon (outer no-fly zone)
+        if len(self._red_boundary) >= 2:
+            red_pts = []
+            for bp in self._red_boundary:
+                px, py = self.latlon_to_pixels(bp.lat, bp.lon, self.zoom)
+                red_pts.append(QtCore.QPoint(int(px - tlx), int(py - tly)))
 
-            if zone.zone_type == ZONE_CRITICAL:
-                # Red zone - CRITICAL / NO-FLY
-                fill_color = QtGui.QColor(255, 0, 0, 60)  # Semi-transparent red
-                border_color = QtGui.QColor(255, 0, 0, 200)  # Solid red border
-                border_width = 3
-            else:  # ZONE_WARNING
-                # Yellow zone - WARNING
-                fill_color = QtGui.QColor(255, 255, 0, 50)  # Semi-transparent yellow
-                border_color = QtGui.QColor(255, 200, 0, 200)  # Orange-yellow border
-                border_width = 2
+            # Draw red boundary fill (area OUTSIDE is no-fly, so we draw boundary line only)
+            p.setPen(QPen(QtGui.QColor(255, 0, 0, 255), 3))  # Solid red border
+            p.setBrush(QtGui.QColor(255, 0, 0, 30))  # Very light red fill for visibility
 
-            # Draw filled circle
-            p.setBrush(fill_color)
-            p.setPen(QPen(border_color, border_width))
-            p.drawEllipse(QtCore.QPointF(zone_sx, zone_sy), radius_pixels, radius_pixels)
+            if len(red_pts) >= 3:
+                p.drawPolygon(QtGui.QPolygon(red_pts))
+            else:
+                # Draw lines for incomplete polygon
+                for i in range(len(red_pts) - 1):
+                    p.drawLine(red_pts[i], red_pts[i+1])
 
-            # Draw zone label
-            font = QFont("Arial", 9, QFont.Bold)
-            p.setFont(font)
-            label = zone.name if zone.name else ("CRITICAL" if zone.zone_type == ZONE_CRITICAL else "WARNING")
-            # Draw label with outline for visibility
-            p.setPen(QPen(Qt.black, 3))
-            p.drawText(int(zone_sx - 30), int(zone_sy - radius_pixels - 8), label)
-            p.setPen(border_color)
-            p.drawText(int(zone_sx - 30), int(zone_sy - radius_pixels - 8), label)
+            # Draw vertex markers
+            p.setBrush(QtGui.QColor(255, 0, 0))
+            p.setPen(QPen(Qt.white, 2))
+            for i, pt in enumerate(red_pts):
+                p.drawEllipse(pt, 5, 5)
 
-            # Draw center marker
-            p.setPen(QPen(border_color, 2))
-            p.drawLine(zone_sx - 5, zone_sy, zone_sx + 5, zone_sy)
-            p.drawLine(zone_sx, zone_sy - 5, zone_sx, zone_sy + 5)
+        # Draw YELLOW boundary polygon (inner safe zone)
+        if len(self._yellow_boundary) >= 3:
+            yellow_pts = []
+            for bp in self._yellow_boundary:
+                px, py = self.latlon_to_pixels(bp.lat, bp.lon, self.zoom)
+                yellow_pts.append(QtCore.QPoint(int(px - tlx), int(py - tly)))
+
+            # Yellow boundary - this is where waypoints should be
+            p.setPen(QPen(QtGui.QColor(255, 200, 0, 255), 2))  # Yellow border
+            p.setBrush(QtGui.QColor(255, 255, 0, 40))  # Light yellow fill
+            p.drawPolygon(QtGui.QPolygon(yellow_pts))
 
         # crosshair
         p.setPen(Qt.red); p.drawLine(w//2-10,h//2,w//2+10,h//2); p.drawLine(w//2,h//2-10,w//2,h//2+10)
 
-        # draw planned path/points (high contrast)
+        # draw planned path/points (waypoints inside yellow zone)
         if self._wps:
             pts=[]
             for wp in self._wps:
                 px,py=self.latlon_to_pixels(wp.lat,wp.lon,self.zoom)
                 sx=int(px-tlx); sy=int(py-tly)
                 pts.append((sx,sy))
-            p.setPen(QPen(Qt.yellow, 3))
+            p.setPen(QPen(Qt.cyan, 3))  # Cyan for waypoint path
             for i in range(len(pts)-1):
                 p.drawLine(pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1])
             for i,(sx,sy) in enumerate(pts):
@@ -1570,69 +1680,59 @@ class MapWidget(QWidget):
                 # index label with halo
                 label = str(i)
                 font = QFont("Consolas", 10); font.setBold(True); p.setFont(font)
-                # black outline then white text
                 p.setPen(QPen(Qt.black, 4))
                 p.drawText(sx+10, sy-10, label)
                 p.setPen(Qt.white)
                 p.drawText(sx+10, sy-10, label)
 
-        # Draw drone icon at GPS position
+        # Draw drone icon at GPS position (simple icon, no coordinates)
         if self._drone_visible and self._drone_lat is not None and self._drone_lon is not None:
             drone_px, drone_py = self.latlon_to_pixels(self._drone_lat, self._drone_lon, self.zoom)
             drone_sx = int(drone_px - tlx)
             drone_sy = int(drone_py - tly)
 
-            # Determine drone color based on zone violations
+            # Determine drone color based on zone status
             if self.is_in_critical_zone():
-                drone_color = QtGui.QColor(255, 0, 0)  # Red - in critical zone
-                pulse_color = QtGui.QColor(255, 0, 0, 100)
+                drone_color = QtGui.QColor(255, 0, 0)  # Red - outside boundary
             elif self.is_in_warning_zone():
-                drone_color = QtGui.QColor(255, 200, 0)  # Orange - in warning zone
-                pulse_color = QtGui.QColor(255, 200, 0, 80)
+                drone_color = QtGui.QColor(255, 200, 0)  # Orange - in buffer zone
             else:
-                drone_color = QtGui.QColor(0, 255, 0)  # Green - safe
-                pulse_color = QtGui.QColor(0, 255, 0, 60)
-
-            # Draw pulse effect (outer glow)
-            p.setBrush(pulse_color)
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(QtCore.QPoint(drone_sx, drone_sy), 20, 20)
+                drone_color = QtGui.QColor(0, 255, 0)  # Green - in safe zone
 
             # Save painter state for rotation
             p.save()
             p.translate(drone_sx, drone_sy)
-            p.rotate(self._drone_yaw)  # Rotate to heading (0 = North)
+            p.rotate(self._drone_yaw)
 
-            # Draw drone icon (triangle pointing up = forward direction)
-            drone_size = 12
+            # Draw drone icon (arrow shape)
+            drone_size = 14
             drone_points = [
-                QtCore.QPoint(0, -drone_size),           # Nose (forward)
-                QtCore.QPoint(-drone_size//2, drone_size//2),   # Left rear
-                QtCore.QPoint(0, drone_size//4),         # Center rear indent
-                QtCore.QPoint(drone_size//2, drone_size//2),    # Right rear
+                QtCore.QPoint(0, -drone_size),           # Nose
+                QtCore.QPoint(-drone_size//2, drone_size//2),
+                QtCore.QPoint(0, drone_size//4),
+                QtCore.QPoint(drone_size//2, drone_size//2),
             ]
 
-            # Draw outline
             p.setBrush(drone_color)
             p.setPen(QPen(Qt.black, 2))
             p.drawPolygon(QtGui.QPolygon(drone_points))
 
-            # Draw direction indicator line
+            # Direction indicator
             p.setPen(QPen(Qt.white, 2))
-            p.drawLine(0, 0, 0, -drone_size + 3)
+            p.drawLine(0, 0, 0, -drone_size + 4)
 
             p.restore()
 
-            # Draw drone info label
-            font = QFont("Arial", 8, QFont.Bold)
+        # Draw mode indicator
+        if self._draw_boundary_mode:
+            font = QFont("Arial", 12, QFont.Bold)
             p.setFont(font)
-            info_text = f"({self._drone_lat:.5f}, {self._drone_lon:.5f})"
             p.setPen(QPen(Qt.black, 3))
-            p.drawText(drone_sx + 15, drone_sy + 5, info_text)
-            p.setPen(Qt.white)
-            p.drawText(drone_sx + 15, drone_sy + 5, info_text)
+            p.drawText(10, 30, "DRAW BOUNDARY MODE - Click to add points")
+            p.setPen(QtGui.QColor(255, 100, 100))
+            p.drawText(10, 30, "DRAW BOUNDARY MODE - Click to add points")
 
-        p.setPen(Qt.black); p.drawText(10, self.height()-10, f"Lat {self.center_lat:.5f}  Lon {self.center_lon:.5f}  Zoom {self.zoom}")
+        p.setPen(Qt.black); p.drawText(10, self.height()-10, f"Zoom {self.zoom}")
 
     def _status(self, s: str):
         sb = self._statusbar() if callable(self._statusbar) else None
@@ -1817,279 +1917,193 @@ class MapDashboard(QWidget):
         return w
 
     def _build_boundary_tab(self):
-        """Build the boundary zones configuration tab."""
+        """Build the boundary configuration tab - polygon-based like AeroGCS."""
         w = QWidget()
         v = QVBoxLayout(w)
 
         # Header
-        header = QLabel("Boundary Zones - Geofencing Configuration")
+        header = QLabel("Geofence Boundary - Draw Flight Area")
         header.setStyleSheet("QLabel { font-weight: bold; font-size: 14px; padding: 10px; background: #2d2d2d; color: white; }")
         v.addWidget(header)
 
         # Instructions
         instructions = QLabel(
-            "Define circular boundary zones around specific GPS coordinates.\n"
-            "• RED (Critical): Drone should NEVER enter - triggers emergency failsafe\n"
-            "• YELLOW (Warning): Drone can enter but operations restricted - triggers warning"
+            "Draw the RED boundary polygon on the map - this is the outer limit (NO-FLY zone outside).\n"
+            "The YELLOW zone is automatically created inside with adjustable buffer width.\n"
+            "Waypoints should be placed inside the YELLOW zone for safe drone operation."
         )
         instructions.setStyleSheet("QLabel { padding: 10px; background: #f5f5f5; border: 1px solid #ddd; }")
         v.addWidget(instructions)
 
-        # Zone input form
-        form_group = QWidget()
-        form_layout = QGridLayout(form_group)
+        # Drawing controls
+        draw_group = QWidget()
+        draw_layout = QHBoxLayout(draw_group)
 
-        form_layout.addWidget(QLabel("Zone Type:"), 0, 0)
-        self.zone_type_combo = QComboBox()
-        self.zone_type_combo.addItem("CRITICAL (Red - No Fly)", ZONE_CRITICAL)
-        self.zone_type_combo.addItem("WARNING (Yellow - Caution)", ZONE_WARNING)
-        form_layout.addWidget(self.zone_type_combo, 0, 1)
+        self.btn_draw_boundary = QCheckBox("Draw RED Boundary (Click on Map)")
+        self.btn_draw_boundary.setStyleSheet("QCheckBox { font-weight: bold; color: #c00; }")
+        self.btn_draw_boundary.stateChanged.connect(self._toggle_draw_mode)
+        draw_layout.addWidget(self.btn_draw_boundary)
 
-        form_layout.addWidget(QLabel("Zone Name:"), 0, 2)
-        self.zone_name_input = QtWidgets.QLineEdit()
-        self.zone_name_input.setPlaceholderText("e.g., Airport, Power Lines")
-        form_layout.addWidget(self.zone_name_input, 0, 3)
+        self.btn_close_boundary = QPushButton("Close Boundary")
+        self.btn_close_boundary.setToolTip("Connect first and last points to close the polygon")
+        self.btn_close_boundary.clicked.connect(self._close_boundary)
+        draw_layout.addWidget(self.btn_close_boundary)
 
-        form_layout.addWidget(QLabel("Center Latitude:"), 1, 0)
-        self.zone_lat_input = QtWidgets.QLineEdit()
-        self.zone_lat_input.setPlaceholderText("e.g., 20.5937")
-        form_layout.addWidget(self.zone_lat_input, 1, 1)
+        self.btn_undo_point = QPushButton("Undo Last Point")
+        self.btn_undo_point.clicked.connect(self._undo_boundary_point)
+        draw_layout.addWidget(self.btn_undo_point)
 
-        form_layout.addWidget(QLabel("Center Longitude:"), 1, 2)
-        self.zone_lon_input = QtWidgets.QLineEdit()
-        self.zone_lon_input.setPlaceholderText("e.g., 78.9629")
-        form_layout.addWidget(self.zone_lon_input, 1, 3)
+        self.btn_clear_boundary = QPushButton("Clear Boundary")
+        self.btn_clear_boundary.setStyleSheet("QPushButton { background: #f44336; color: white; }")
+        self.btn_clear_boundary.clicked.connect(self._clear_boundary)
+        draw_layout.addWidget(self.btn_clear_boundary)
 
-        form_layout.addWidget(QLabel("Radius (meters):"), 2, 0)
-        self.zone_radius_input = QtWidgets.QLineEdit()
-        self.zone_radius_input.setPlaceholderText("e.g., 500")
-        form_layout.addWidget(self.zone_radius_input, 2, 1)
+        draw_layout.addStretch()
+        v.addWidget(draw_group)
 
-        # Use GPS button
-        self.btn_use_gps = QPushButton("Use Current GPS Position")
-        self.btn_use_gps.setToolTip("Fill in current drone GPS position as zone center")
-        self.btn_use_gps.clicked.connect(self._use_gps_for_zone)
-        form_layout.addWidget(self.btn_use_gps, 2, 2)
+        # Yellow buffer settings
+        buffer_group = QWidget()
+        buffer_layout = QHBoxLayout(buffer_group)
 
-        # Use map center button
-        self.btn_use_map_center = QPushButton("Use Map Center")
-        self.btn_use_map_center.setToolTip("Fill in current map center position as zone center")
-        self.btn_use_map_center.clicked.connect(self._use_map_center_for_zone)
-        form_layout.addWidget(self.btn_use_map_center, 2, 3)
+        buffer_layout.addWidget(QLabel("Yellow Zone Buffer Width:"))
+        self.buffer_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.buffer_slider.setMinimum(10)
+        self.buffer_slider.setMaximum(200)
+        self.buffer_slider.setValue(50)
+        self.buffer_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.buffer_slider.setTickInterval(20)
+        self.buffer_slider.valueChanged.connect(self._update_buffer_width)
+        buffer_layout.addWidget(self.buffer_slider)
 
-        v.addWidget(form_group)
+        self.buffer_label = QLabel("50 m")
+        self.buffer_label.setMinimumWidth(60)
+        buffer_layout.addWidget(self.buffer_label)
 
-        # Action buttons
-        btn_row = QWidget()
-        btn_layout = QHBoxLayout(btn_row)
+        buffer_layout.addStretch()
+        v.addWidget(buffer_group)
 
-        self.btn_add_zone = QPushButton("Add Boundary Zone")
-        self.btn_add_zone.setStyleSheet("QPushButton { background: #4CAF50; color: white; padding: 8px 16px; }")
-        self.btn_add_zone.clicked.connect(self._add_boundary_zone)
-        btn_layout.addWidget(self.btn_add_zone)
+        # Boundary points table
+        points_label = QLabel("Boundary Points (RED Zone)")
+        points_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background: #ffcccc; }")
+        v.addWidget(points_label)
 
-        self.btn_clear_zones = QPushButton("Clear All Zones")
-        self.btn_clear_zones.setStyleSheet("QPushButton { background: #f44336; color: white; padding: 8px 16px; }")
-        self.btn_clear_zones.clicked.connect(self._clear_all_zones)
-        btn_layout.addWidget(self.btn_clear_zones)
-
-        btn_layout.addStretch()
-        v.addWidget(btn_row)
-
-        # Zone list table
-        list_label = QLabel("Configured Boundary Zones")
-        list_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background: #e8e8e8; }")
-        v.addWidget(list_label)
-
-        self.zones_table = QTableWidget(0, 5)
-        self.zones_table.setHorizontalHeaderLabels(["Type", "Name", "Latitude", "Longitude", "Radius (m)"])
-        self.zones_table.horizontalHeader().setStretchLastSection(True)
-        self.zones_table.setSelectionBehavior(QTableWidget.SelectRows)
-        v.addWidget(self.zones_table, 1)
-
-        # Delete selected zone button
-        self.btn_delete_zone = QPushButton("Delete Selected Zone")
-        self.btn_delete_zone.clicked.connect(self._delete_selected_zone)
-        v.addWidget(self.btn_delete_zone)
+        self.boundary_points_table = QTableWidget(0, 3)
+        self.boundary_points_table.setHorizontalHeaderLabels(["#", "Latitude", "Longitude"])
+        self.boundary_points_table.horizontalHeader().setStretchLastSection(True)
+        self.boundary_points_table.setMaximumHeight(150)
+        v.addWidget(self.boundary_points_table)
 
         # Status display
-        self.boundary_status = QLabel("Status: No boundary zones configured")
-        self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #0f0; font-family: monospace; }")
+        self.boundary_status = QLabel("Status: No boundary defined")
+        self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #888; font-family: monospace; }")
         v.addWidget(self.boundary_status)
 
+        # Connect boundary change signal
+        self.map.boundaryChanged.connect(self._on_boundary_changed)
+        self.plan_map.boundaryChanged.connect(self._on_boundary_changed)
+
+        v.addStretch()
         return w
 
-    def _use_gps_for_zone(self):
-        """Fill zone center with current GPS position."""
-        if self._last_gps_lat is not None and self._last_gps_lon is not None:
-            self.zone_lat_input.setText(f"{self._last_gps_lat:.7f}")
-            self.zone_lon_input.setText(f"{self._last_gps_lon:.7f}")
-            self.worker.L("Zone center set to current GPS position")
+    def _toggle_draw_mode(self):
+        """Toggle boundary drawing mode."""
+        enabled = self.btn_draw_boundary.isChecked()
+        self.map.set_draw_boundary_mode(enabled)
+        self.plan_map.set_draw_boundary_mode(enabled)
+        if enabled:
+            self.btn_add_mode.setChecked(False)  # Disable waypoint mode
+            print("[Boundary] Draw mode ENABLED - Click on map to add boundary points")
         else:
-            QMessageBox.warning(self, "GPS Not Available",
-                               "No GPS position available.\n\nConnect to drone and wait for GPS fix.")
+            print("[Boundary] Draw mode DISABLED")
 
-    def _use_map_center_for_zone(self):
-        """Fill zone center with current map center."""
-        self.zone_lat_input.setText(f"{self.map.center_lat:.7f}")
-        self.zone_lon_input.setText(f"{self.map.center_lon:.7f}")
-        self.worker.L("Zone center set to map center")
+    def _close_boundary(self):
+        """Close the boundary polygon."""
+        self.map.close_boundary()
+        self.plan_map.set_red_boundary(self.map.get_red_boundary())
+        print("[Boundary] Boundary closed")
 
-    def _add_boundary_zone(self):
-        """Add a new boundary zone from the form inputs."""
-        try:
-            zone_type = self.zone_type_combo.currentData()
-            name = self.zone_name_input.text().strip() or "Unnamed Zone"
-            lat = float(self.zone_lat_input.text())
-            lon = float(self.zone_lon_input.text())
-            radius = float(self.zone_radius_input.text())
+    def _undo_boundary_point(self):
+        """Undo last boundary point."""
+        self.map.undo_last_boundary_point()
+        self.plan_map.set_red_boundary(self.map.get_red_boundary())
 
-            if radius <= 0:
-                raise ValueError("Radius must be positive")
-            if not (-90 <= lat <= 90):
-                raise ValueError("Latitude must be between -90 and 90")
-            if not (-180 <= lon <= 180):
-                raise ValueError("Longitude must be between -180 and 180")
-
-        except ValueError as e:
-            QMessageBox.warning(self, "Invalid Input", f"Please check your inputs:\n\n{e}")
+    def _clear_boundary(self):
+        """Clear all boundary points."""
+        if len(self.map.get_red_boundary()) == 0:
             return
-
-        zone = BoundaryZone(
-            zone_type=zone_type,
-            center_lat=lat,
-            center_lon=lon,
-            radius_m=radius,
-            name=name
-        )
-
-        # Add to both maps
-        self.map.add_boundary_zone(zone)
-        self.plan_map.add_boundary_zone(zone)
-
-        # Add to table
-        r = self.zones_table.rowCount()
-        self.zones_table.insertRow(r)
-        type_text = "CRITICAL" if zone_type == ZONE_CRITICAL else "WARNING"
-        self.zones_table.setItem(r, 0, QTableWidgetItem(type_text))
-        self.zones_table.setItem(r, 1, QTableWidgetItem(name))
-        self.zones_table.setItem(r, 2, QTableWidgetItem(f"{lat:.7f}"))
-        self.zones_table.setItem(r, 3, QTableWidgetItem(f"{lon:.7f}"))
-        self.zones_table.setItem(r, 4, QTableWidgetItem(f"{radius:.1f}"))
-
-        # Color code the row
-        color = QtGui.QColor(255, 200, 200) if zone_type == ZONE_CRITICAL else QtGui.QColor(255, 255, 200)
-        for col in range(5):
-            self.zones_table.item(r, col).setBackground(color)
-
-        # Clear inputs
-        self.zone_name_input.clear()
-        self.zone_lat_input.clear()
-        self.zone_lon_input.clear()
-        self.zone_radius_input.clear()
-
-        # Update status
-        self._update_boundary_status()
-
-        print(f"[Boundary] Added {type_text} zone '{name}' at ({lat:.6f}, {lon:.6f}) radius {radius}m")
-        self.worker.L(f"Added {type_text} boundary zone: {name}")
-
-        # Center map on new zone
-        self.map.recenter(lat, lon)
-        self.map.zoom = max(14, self.map.zoom)
-        self.map.update()
-
-    def _delete_selected_zone(self):
-        """Delete the selected boundary zone."""
-        selected_rows = sorted({idx.row() for idx in self.zones_table.selectedIndexes()}, reverse=True)
-        if not selected_rows:
-            QMessageBox.information(self, "Delete Zone", "Please select a zone to delete.")
-            return
-
-        # Get current zones and remove selected ones
-        zones = self.map.get_boundary_zones()
-        for row in selected_rows:
-            if 0 <= row < len(zones):
-                zone = zones[row]
-                print(f"[Boundary] Removing zone '{zone.name}'")
-            self.zones_table.removeRow(row)
-
-        # Rebuild zones from table
-        new_zones = []
-        for r in range(self.zones_table.rowCount()):
-            zone_type = ZONE_CRITICAL if self.zones_table.item(r, 0).text() == "CRITICAL" else ZONE_WARNING
-            name = self.zones_table.item(r, 1).text()
-            lat = float(self.zones_table.item(r, 2).text())
-            lon = float(self.zones_table.item(r, 3).text())
-            radius = float(self.zones_table.item(r, 4).text())
-            new_zones.append(BoundaryZone(zone_type, lat, lon, radius, name))
-
-        self.map.set_boundary_zones(new_zones)
-        self.plan_map.set_boundary_zones(new_zones)
-        self._update_boundary_status()
-
-    def _clear_all_zones(self):
-        """Clear all boundary zones."""
-        if self.zones_table.rowCount() == 0:
-            QMessageBox.information(self, "Clear Zones", "No boundary zones to clear.")
-            return
-
-        reply = QMessageBox.question(self, "Clear All Zones",
-                                     "This will remove ALL boundary zones.\n\nAre you sure?",
+        reply = QMessageBox.question(self, "Clear Boundary",
+                                     "Clear all boundary points?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+        if reply == QMessageBox.Yes:
+            self.map.clear_boundary()
+            self.plan_map.clear_boundary()
+            self.boundary_points_table.setRowCount(0)
+            print("[Boundary] Boundary cleared")
 
-        self.zones_table.setRowCount(0)
-        self.map.clear_boundary_zones()
-        self.plan_map.clear_boundary_zones()
+    def _update_buffer_width(self, value: int):
+        """Update the yellow buffer zone width."""
+        self.buffer_label.setText(f"{value} m")
+        self.map.set_yellow_buffer(float(value))
+        self.plan_map.set_yellow_buffer(float(value))
+
+    def _on_boundary_changed(self):
+        """Called when boundary points change."""
+        # Sync boundaries between maps
+        red_boundary = self.map.get_red_boundary()
+        self.plan_map.set_red_boundary(red_boundary)
+
+        # Update table
+        self.boundary_points_table.setRowCount(len(red_boundary))
+        for i, bp in enumerate(red_boundary):
+            self.boundary_points_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.boundary_points_table.setItem(i, 1, QTableWidgetItem(f"{bp.lat:.7f}"))
+            self.boundary_points_table.setItem(i, 2, QTableWidgetItem(f"{bp.lon:.7f}"))
+
         self._update_boundary_status()
-        print("[Boundary] All zones cleared")
-        self.worker.L("All boundary zones cleared")
 
     def _update_boundary_status(self):
         """Update the boundary status display."""
-        zones = self.map.get_boundary_zones()
-        critical_count = sum(1 for z in zones if z.zone_type == ZONE_CRITICAL)
-        warning_count = sum(1 for z in zones if z.zone_type == ZONE_WARNING)
+        red_pts = len(self.map.get_red_boundary())
+        yellow_pts = len(self.map.get_yellow_boundary())
+        buffer = self.map.get_yellow_buffer()
 
-        status_text = f"Status: {len(zones)} zone(s) configured"
-        if zones:
-            status_text += f" | RED (Critical): {critical_count} | YELLOW (Warning): {warning_count}"
-
-        if self._last_gps_lat is not None:
-            status_text += f"\nDrone Position: ({self._last_gps_lat:.6f}, {self._last_gps_lon:.6f})"
-            if self.map.is_in_critical_zone():
-                status_text += " | IN CRITICAL ZONE!"
-                self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #ff0000; color: white; font-family: monospace; font-weight: bold; }")
-            elif self.map.is_in_warning_zone():
-                status_text += " | IN WARNING ZONE"
-                self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #ff9800; color: black; font-family: monospace; font-weight: bold; }")
-            else:
-                status_text += " | SAFE"
-                self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #0f0; font-family: monospace; }")
-        else:
+        if red_pts < 3:
+            status = f"Status: Draw at least 3 points to define boundary ({red_pts} points so far)"
             self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #888; font-family: monospace; }")
+        else:
+            status = f"Boundary: {red_pts} points | Buffer: {buffer:.0f}m"
+            if self._last_gps_lat is not None:
+                if self.map.is_in_critical_zone():
+                    status += " | DRONE OUTSIDE BOUNDARY!"
+                    self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #ff0000; color: white; font-family: monospace; font-weight: bold; }")
+                elif self.map.is_in_warning_zone():
+                    status += " | Drone in buffer zone"
+                    self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #ff9800; color: black; font-family: monospace; }")
+                elif self.map.is_in_safe_zone():
+                    status += " | Drone in SAFE zone"
+                    self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #4CAF50; color: white; font-family: monospace; }")
+                else:
+                    self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #0f0; font-family: monospace; }")
+            else:
+                self.boundary_status.setStyleSheet("QLabel { padding: 10px; background: #333; color: #0f0; font-family: monospace; }")
 
-        self.boundary_status.setText(status_text)
+        self.boundary_status.setText(status)
 
-    def _on_boundary_violation(self, zone_type: str, zone_name: str):
+    def _on_boundary_violation(self, zone_type: str):
         """Handle boundary violation alerts."""
-        if zone_type == ZONE_CRITICAL:
-            print(f"[ALERT] CRITICAL BOUNDARY VIOLATION: Drone entered '{zone_name}'!")
-            self.worker.L(f"CRITICAL: Drone in NO-FLY zone '{zone_name}'!")
-            QMessageBox.critical(self, "CRITICAL BOUNDARY VIOLATION",
-                                f"DRONE HAS ENTERED CRITICAL NO-FLY ZONE!\n\n"
-                                f"Zone: {zone_name}\n\n"
-                                f"IMMEDIATE ACTION REQUIRED!\n"
-                                f"Consider triggering RTL or emergency landing.")
-        else:  # ZONE_WARNING
-            print(f"[WARNING] Boundary warning: Drone entered warning zone '{zone_name}'")
-            self.worker.L(f"WARNING: Drone in caution zone '{zone_name}'")
-            # Don't show popup for warning zones to avoid interruption, just log it
+        if zone_type == "critical":
+            print("[ALERT] CRITICAL: Drone is OUTSIDE the boundary!")
+            self.worker.L("CRITICAL: Drone outside geofence!")
+            QMessageBox.critical(self, "BOUNDARY VIOLATION",
+                                "DRONE IS OUTSIDE THE GEOFENCE BOUNDARY!\n\n"
+                                "IMMEDIATE ACTION REQUIRED!\n"
+                                "Consider triggering RTL or emergency landing.")
+        else:
+            print("[WARNING] Drone entered buffer zone")
+            self.worker.L("WARNING: Drone in buffer zone")
             sb = self._statusbar_provider() if callable(self._statusbar_provider) else None
             if sb:
-                sb.showMessage(f"WARNING: Drone in boundary zone '{zone_name}'", 5000)
+                sb.showMessage("WARNING: Drone in buffer zone - approaching boundary", 5000)
 
         self._update_boundary_status()
 
